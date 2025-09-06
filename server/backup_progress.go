@@ -49,10 +49,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	
 	if total > 0 {
 		// Percentage mode - very responsive
-		percentage = int((written * 100) / total)
-		if percentage > 100 {
-			percentage = 100
-		}
+		percentage = min(100, int((written*100)/total))
 		// Send on ANY percentage increase (1%, 2%, 3%... super live!)
 		shouldSend = percentage > int(lastSent)
 		if shouldSend {

@@ -70,7 +70,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		}
 	}
 
-	// Ultra-simple progress tracking using existing Archive.Progress system
+	// Smart progress tracking: estimate total size once, then track progress
 	progressInstance := progress.NewProgress(0)
 	
 	// Simple progress tracker without goroutines
@@ -83,7 +83,15 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	// Connect progress callback - called on every Archive.Write()!
 	progressInstance.ProgressCallback = progressTracker.CheckProgress
 
-	// NO DiskUsage() - too expensive! Let Archive.Write() update progress naturally
+	// SYNCHRONOUS size estimation - must happen BEFORE backup starts to avoid race condition
+	// Use only ultra-fast cached value to prevent blocking
+	if cachedSize := s.Filesystem().CachedUsage(); cachedSize > 0 {
+		// Use cached value (instantaneous) with compression estimate
+		estimatedSize := cachedSize / 2 // tar.gz compression ~50%
+		progressInstance.SetTotal(uint64(estimatedSize))
+		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("set backup progress total from cached disk usage")
+	}
+	// If no cached value available, stay in bytes-only mode (percentage = -1) - still ultra live!
 	ad, err := s.generateBackupWithProgress(b, ignored, progressInstance, progressTracker)
 	if err != nil {
 		progressTracker.SendFinalProgress(false) // Send error progress
@@ -178,7 +186,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		progress:   nil, // No progress instance for restore (file-based)
 	}
 
-	updateProgress := func(file string, afterWrite bool) {
+	updateProgress := func(_ string, afterWrite bool) {
 		if afterWrite {
 			// After successful file write - increment and send immediate update
 			current := atomic.AddInt64(&processedFiles, 1)
@@ -237,7 +245,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 }
 
 // generateBackupWithProgress creates a backup with progress tracking
-func (s *Server) generateBackupWithProgress(b backup.BackupInterface, ignored string, progressInstance *progress.Progress, tracker *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
+func (s *Server) generateBackupWithProgress(b backup.BackupInterface, ignored string, progressInstance *progress.Progress, _ *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
 	// For local backups, we need to inject the progress tracker into the archive
 	if localBackup, ok := b.(*backup.LocalBackup); ok {
 		return s.generateLocalBackupWithProgress(localBackup, ignored, progressInstance)
