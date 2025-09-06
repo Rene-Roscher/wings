@@ -138,6 +138,10 @@ func putServerRenameFiles(c *gin.Context) {
 					}
 					return err
 				}
+				// Log the rename activity
+				s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivitySftpRename, models.ActivityMeta{
+					"files": []map[string]string{{"from": pf, "to": pt}},
+				})
 				return nil
 			}
 		})
@@ -206,8 +210,10 @@ func postServerDeleteFiles(c *gin.Context) {
 
 	// Loop over the array of files passed in and delete them. If any of the file deletions
 	// fail just abort the process entirely.
+	deletedFiles := make([]string, 0, len(data.Files))
 	for _, p := range data.Files {
 		pi := path.Join(data.Root, p)
+		deletedFiles = append(deletedFiles, pi)
 
 		g.Go(func() error {
 			select {
@@ -223,6 +229,11 @@ func postServerDeleteFiles(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	
+	// Log the delete activity
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivitySftpDelete, models.ActivityMeta{
+		"files": deletedFiles,
+	})
 
 	c.Status(http.StatusNoContent)
 }
@@ -247,6 +258,10 @@ func postServerWriteFile(c *gin.Context) {
 		return
 	}
 
+	// Check if file exists to determine if this is create or update
+	_, statErr := s.Filesystem().Stat(f)
+	isNewFile := errors.Is(statErr, os.ErrNotExist)
+	
 	if err := s.Filesystem().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -258,6 +273,15 @@ func postServerWriteFile(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+
+	// Log the activity - use system user for API calls
+	event := server.ActivitySftpWrite
+	if isNewFile {
+		event = server.ActivitySftpCreate
+	}
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), event, models.ActivityMeta{
+		"file": f,
+	})
 
 	c.Status(http.StatusNoContent)
 }
@@ -332,6 +356,10 @@ func postServerPullRemoteFile(c *gin.Context) {
 			return err
 		} else {
 			s.Log().WithField("download_id", dl.Identifier).Info("completed pull of remote file")
+			s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivityFileDownloaded, models.ActivityMeta{
+				"file": dl.Path(),
+				"url":  data.URL,
+			})
 		}
 		return nil
 	}
@@ -355,6 +383,7 @@ func postServerPullRemoteFile(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	
 	c.JSON(http.StatusOK, &st)
 }
 
@@ -391,6 +420,12 @@ func postServerCreateDirectory(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	
+	// Log the create directory activity
+	dirPath := path.Join(data.Path, data.Name)
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivitySftpCreateDirectory, models.ActivityMeta{
+		"directory": dirPath,
+	})
 
 	c.Status(http.StatusNoContent)
 }
@@ -426,6 +461,11 @@ func postServerCompressFiles(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivityFileCompressed, models.ActivityMeta{
+		"files": data.Files,
+		"root":  data.RootPath,
+	})
 
 	c.JSON(http.StatusOK, &filesystem.Stat{
 		FileInfo: f,
@@ -474,6 +514,12 @@ func postServerDecompressFiles(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivityFileDecompressed, models.ActivityMeta{
+		"file": data.File,
+		"root": data.RootPath,
+	})
+
 	c.Status(http.StatusNoContent)
 }
 
@@ -544,6 +590,11 @@ func postServerChmodFile(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+
+	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivityFileChmod, models.ActivityMeta{
+		"files": data.Files,
+		"root":  data.Root,
+	})
 
 	c.Status(http.StatusNoContent)
 }

@@ -362,3 +362,8 @@ func (s *Server) ToAPIResponse() APIResponse {
 		Configuration: *s.Config(),
 	}
 }
+
+// PublishActivity implements the EventPublisher interface for SFTP event handling
+func (s *Server) PublishActivity(event string, data map[string]any) {
+	s.Events().Publish(ActivityEvent, data)
+}

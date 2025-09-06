@@ -44,9 +44,10 @@ func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
 	}
 
 	events := eventHandler{
-		ip:     sc.RemoteAddr().String(),
-		user:   uuid,
-		server: srv.ID(),
+		ip:        sc.RemoteAddr().String(),
+		user:      uuid,
+		server:    srv.ID(),
+		publisher: srv,  // Server implements EventPublisher interface
 	}
 
 	return &Handler{
