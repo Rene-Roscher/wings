@@ -9,7 +9,7 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/Rene-Roscher/wings/environment"
 	"github.com/Rene-Roscher/wings/internal/progress"
@@ -84,14 +84,30 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	progressInstance.ProgressCallback = progressTracker.CheckProgress
 
 	// SYNCHRONOUS size estimation - must happen BEFORE backup starts to avoid race condition
-	// Use only ultra-fast cached value to prevent blocking
-	if cachedSize := s.Filesystem().CachedUsage(); cachedSize > 0 {
+	cachedSize := s.Filesystem().CachedUsage()
+	s.Log().WithField("cached_disk_usage", cachedSize).Debug("checking cached disk usage for backup progress")
+	
+	// Always try to get a size estimate for percentage calculation
+	var estimatedSize int64
+	if cachedSize > 0 {
 		// Use cached value (instantaneous) with compression estimate
-		estimatedSize := cachedSize / 2 // tar.gz compression ~50%
-		progressInstance.SetTotal(uint64(estimatedSize))
-		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("set backup progress total from cached disk usage")
+		estimatedSize = cachedSize / 2 // tar.gz compression ~50%
+		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("using cached disk usage for backup progress")
+	} else {
+		// Fallback: do one quick disk usage calculation 
+		s.Log().Debug("no cached usage, calculating disk usage for backup progress")
+		if diskSize, err := s.Filesystem().DiskUsage(true); err == nil && diskSize > 0 {
+			estimatedSize = diskSize / 2 // tar.gz compression ~50%  
+			s.Log().WithField("estimated_backup_size", estimatedSize).Debug("calculated disk usage for backup progress")
+		} else {
+			s.Log().WithField("error", err).Warn("failed to calculate disk usage for backup progress - using bytes-only mode")
+		}
 	}
-	// If no cached value available, stay in bytes-only mode (percentage = -1) - still ultra live!
+	
+	// Set total if we got a reasonable estimate
+	if estimatedSize > 0 {
+		progressInstance.SetTotal(uint64(estimatedSize))
+	}
 	ad, err := s.generateBackupWithProgress(b, ignored, progressInstance, progressTracker)
 	if err != nil {
 		progressTracker.SendFinalProgress(false) // Send error progress
@@ -104,7 +120,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 			s.Log().WithField("backup", b.Identifier()).Info("notified panel of failed backup state")
 		}
 
-		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
 			"uuid":          b.Identifier(),
 			"is_successful": false,
 			"checksum":      "",
@@ -130,7 +146,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 
 	// Emit an event over the socket so we can update the backup in realtime on
 	// the frontend for the server.
-	s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+	s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
 		"uuid":          b.Identifier(),
 		"is_successful": true,
 		"checksum":      ad.Checksum,
@@ -170,51 +186,45 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// server being suspended.
 	if s.Environment.State() != environment.ProcessOfflineState {
 		if err = s.Environment.WaitForStop(s.Context(), 2*time.Minute, false); err != nil {
-			if !client.IsErrNotFound(err) {
+			if !errdefs.IsNotFound(err) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}
 		}
 	}
 
-	// Ultra-simple restore progress tracking
+	// Restore progress tracking with real Progress instance
 	var processedFiles int64
-	var lastProgressTime int64
+	
+	// Create progress instance for restore - estimate total from backup file size
+	restoreProgress := progress.NewProgress(0)
+	
+	// Try to get backup file size for percentage calculation
+	if backupSize, err := b.Details(s.Context(), nil); err == nil && backupSize.Size > 0 {
+		// Estimate uncompressed size (tar.gz expansion ~2x)
+		estimatedTotal := backupSize.Size * 2 
+		restoreProgress.SetTotal(uint64(estimatedTotal))
+		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
+	}
 	
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
 		backupType: "restore",
-		progress:   nil, // No progress instance for restore (file-based)
+		progress:   restoreProgress, // Real progress instance!
 	}
+	
+	// Connect callback for percentage tracking
+	restoreProgress.ProgressCallback = progressTracker.CheckProgress
 
-	updateProgress := func(_ string, afterWrite bool) {
-		if afterWrite {
-			// After successful file write - increment and send immediate update
-			current := atomic.AddInt64(&processedFiles, 1)
-			
-			// Smart throttling: send every file, but max every 100ms for super-live feel
-			now := time.Now().UnixNano()
-			lastTime := atomic.LoadInt64(&lastProgressTime)
-			
-			if (now - lastTime) > 100*1000000 { // 100ms = ultra responsive
-				atomic.StoreInt64(&lastProgressTime, now)
-				
-				// Ultra-fast async send with minimal overhead
-				go func(count int64) {
-					if r := recover(); r != nil {
-						return // Minimal recovery
-					}
-					
-					update := BackupProgressUpdate{
-						Type:         "restore", 
-						Percentage:   -1, // File-by-file mode
-						BytesWritten: count,
-						BytesTotal:   0,
-					}
-					
-					s.Events().Publish(BackupProgressEvent, update)
-				}(current)
-			}
+	updateProgress := func(fileSize int64) {
+		// Simulate progress by adding file size to progress tracker
+		// This will trigger the percentage calculation via CheckProgress callback
+		if fileSize > 0 {
+			// Write file size to progress to trigger percentage calculation
+			restoreProgress.Write(make([]byte, fileSize))
 		}
+		
+		// Also track file count
+		atomic.AddInt64(&processedFiles, 1)
 	}
 
 	// Attempt to restore the backup to the server by running through each entry
@@ -233,7 +243,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		atime := info.ModTime()
 		
 		// Send ultra-live progress update AFTER successful write
-		updateProgress(file, true)
+		updateProgress(info.Size())
 		
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
