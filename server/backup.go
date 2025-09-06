@@ -68,10 +68,22 @@ func (s *Server) determineActualServerState() string {
 	return environment.ProcessOfflineState
 }
 
-// Backup performs a server backup and then emits the event over the server
-// websocket. We let the actual backup system handle notifying the panel of the
-// status, but that won't emit a websocket event.
-func (s *Server) Backup(b backup.BackupInterface) error {
+// BackupWithContext performs a server backup with context support for cancellation.
+// This method respects context cancellation at every I/O operation following CLAUDE.md guidelines.
+func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface) error {
+	// Set reasonable timeout if none provided - 6 hours for backup as per CLAUDE.md
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 6*time.Hour)
+		defer cancel()
+	}
+	// Check for context cancellation before proceeding
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	// Set backup state to show in frontend via WebSocket
 	s.Environment.SetState(environment.ProcessBackupState)
 	
@@ -130,6 +142,15 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		
 		// Run disk usage calculation in goroutine with timeout
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.Log().WithField("panic", r).Error("panic in disk usage calculation goroutine")
+					done <- struct {
+						size int64
+						err  error
+					}{0, errors.New("disk usage calculation panicked")}
+				}
+			}()
 			size, err := s.Filesystem().DiskUsage(false) // Fresh calculation
 			done <- struct {
 				size int64
@@ -155,7 +176,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	if estimatedSize > 0 {
 		progressInstance.SetTotal(uint64(estimatedSize))
 	}
-	ad, err := s.generateBackupWithProgress(b, ignored, progressInstance, progressTracker)
+	ad, err := s.generateBackupWithProgress(ctx, b, ignored, progressInstance, progressTracker)
 	if err != nil {
 		progressTracker.SendFinalProgress(false) // Send error progress
 		if err := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); err != nil {
@@ -202,6 +223,16 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	})
 
 	return nil
+}
+
+// Backup performs a server backup - backward compatibility method
+// This method calls BackupWithContext with a background context for legacy compatibility
+func (s *Server) Backup(b backup.BackupInterface) error {
+	// Use background context with 6-hour timeout as per CLAUDE.md production requirements
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+	defer cancel()
+	
+	return s.BackupWithContext(ctx, b)
 }
 
 // RestoreBackup calls the Restore function on the provided backup. Once this
@@ -305,24 +336,24 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	return errors.WithStackIf(err)
 }
 
-// generateBackupWithProgress creates a backup with progress tracking
-func (s *Server) generateBackupWithProgress(b backup.BackupInterface, ignored string, progressInstance *progress.Progress, _ *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
+// generateBackupWithProgress creates a backup with progress tracking and context support
+func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.BackupInterface, ignored string, progressInstance *progress.Progress, _ *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
 	// For local backups, we need to inject the progress tracker into the archive
 	if localBackup, ok := b.(*backup.LocalBackup); ok {
-		return s.generateLocalBackupWithProgress(localBackup, ignored, progressInstance)
+		return s.generateLocalBackupWithProgress(ctx, localBackup, ignored, progressInstance)
 	}
 
 	// For S3 backups, we also need progress tracking
 	if s3Backup, ok := b.(*backup.S3Backup); ok {
-		return s.generateS3BackupWithProgress(s3Backup, ignored, progressInstance)
+		return s.generateS3BackupWithProgress(ctx, s3Backup, ignored, progressInstance)
 	}
 
 	// Fallback to original Generate method if backup type is unknown
-	return b.Generate(s.Context(), s.Filesystem(), ignored)
+	return b.Generate(ctx, s.Filesystem(), ignored)
 }
 
-// generateLocalBackupWithProgress creates a local backup with progress tracking
-func (s *Server) generateLocalBackupWithProgress(b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
+// generateLocalBackupWithProgress creates a local backup with progress tracking and context support  
+func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
 	a := &filesystem.Archive{
 		Filesystem: s.Filesystem(),
 		Ignore:     ignored,
@@ -330,7 +361,7 @@ func (s *Server) generateLocalBackupWithProgress(b *backup.LocalBackup, ignored 
 	}
 
 	s.Log().WithField("backup", b.Identifier()).WithField("path", b.Path()).Info("creating backup for server")
-	if err := a.Create(s.Context(), b.Path()); err != nil {
+	if err := a.Create(ctx, b.Path()); err != nil {
 		return nil, err
 	}
 	s.Log().WithField("backup", b.Identifier()).Info("created backup successfully")
@@ -342,12 +373,12 @@ func (s *Server) generateLocalBackupWithProgress(b *backup.LocalBackup, ignored 
 	return ad, nil
 }
 
-// generateS3BackupWithProgress creates an S3 backup with progress tracking
-func (s *Server) generateS3BackupWithProgress(b *backup.S3Backup, ignored string, _ *progress.Progress) (*backup.ArchiveDetails, error) {
+// generateS3BackupWithProgress creates an S3 backup with progress tracking and context support
+func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, _ *progress.Progress) (*backup.ArchiveDetails, error) {
 	// Work WITH the source: S3Backup.Generate already handles everything correctly
 	// Avoid double-creation by letting the original S3 flow work unmodified
 	// 
 	// Future improvement: Extend backup package to support progress callbacks natively
 	// For now: Accept that S3 progress tracking is limited, but backup works correctly
-	return b.Generate(s.Context(), s.Filesystem(), ignored)
+	return b.Generate(ctx, s.Filesystem(), ignored)
 }

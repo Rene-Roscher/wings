@@ -1,9 +1,11 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -42,13 +44,25 @@ func postServerBackup(c *gin.Context) {
 
 	// Attach the server ID and the request ID to the adapter log context for easier
 	// parsing in the logs.
-	adapter.WithLogContext(map[string]interface{}{
+	adapter.WithLogContext(map[string]any{
 		"server":     s.ID(),
 		"request_id": c.GetString("request_id"),
 	})
 
 	go func(b backup.BackupInterface, s *server.Server, logger *log.Entry) {
-		if err := s.Backup(b); err != nil {
+		// Register operation for cancellation support
+		registry := server.GetBackupOperationRegistry()
+		_, ctx, cancel := registry.Register(data.Uuid, s.ID(), server.OperationTypeBackup)
+		defer func() {
+			cancel()
+			registry.Complete(data.Uuid)
+		}()
+		
+		// Add timeout if not already set
+		ctx, timeoutCancel := context.WithTimeout(ctx, 6*time.Hour)
+		defer timeoutCancel()
+		
+		if err := s.BackupWithContext(ctx, b); err != nil {
 			logger.WithField("error", errors.WithStackIf(err)).Error("router: failed to generate server backup")
 		}
 	}(adapter, s, logger)
@@ -88,11 +102,9 @@ func postServerRestoreBackup(c *gin.Context) {
 	s.SetRestoring(true)
 	hasError := true
 	defer func() {
-		if !hasError {
-			return
+		if hasError {
+			s.SetRestoring(false)
 		}
-
-		s.SetRestoring(false)
 	}()
 
 	logger.Info("processing server backup restore request")
@@ -113,6 +125,7 @@ func postServerRestoreBackup(c *gin.Context) {
 			return
 		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
+			defer s.SetRestoring(false) // Ensure restoring state is always reset
 			logger.Info("starting restoration process for server backup using local driver")
 			if err := s.RestoreBackup(b, nil); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
@@ -120,7 +133,6 @@ func postServerRestoreBackup(c *gin.Context) {
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
 			s.Events().Publish(server.BackupRestoreCompletedEvent, "")
 			logger.Info("completed server restoration from local backup")
-			s.SetRestoring(false)
 		}(s, b, logger)
 		hasError = false
 		c.Status(http.StatusAccepted)
@@ -129,14 +141,13 @@ func postServerRestoreBackup(c *gin.Context) {
 
 	// Since this is not a local backup we need to stream the archive and then
 	// parse over the contents as we go in order to restore it to the server.
-	httpClient := http.Client{}
+	httpClient := http.Client{
+		Timeout: time.Hour * 2, // 2 hour timeout for large backup downloads
+	}
 	logger.Info("downloading backup from remote location...")
-	// TODO: this will hang if there is an issue. We can't use c.Request.Context() (or really any)
-	//  since it will be canceled when the request is closed which happens quickly since we push
-	//  this into the background.
-	//
-	// For now I'm just using the server context so at least the request is canceled if
-	// the server gets deleted.
+	// Use proper timeout to prevent indefinite hangs during backup downloads.
+	// 2 hour timeout should be sufficient for most backup file sizes while preventing
+	// resource exhaustion from stuck connections.
 	req, err := http.NewRequestWithContext(s.Context(), http.MethodGet, data.DownloadUrl, nil)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
@@ -157,6 +168,7 @@ func postServerRestoreBackup(c *gin.Context) {
 	}
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
+		defer s.SetRestoring(false) // Ensure restoring state is always reset
 		logger.Info("starting restoration process for server backup using S3 driver")
 		if err := s.RestoreBackup(backup.NewS3(client, uuid, ""), res.Body); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
@@ -164,7 +176,6 @@ func postServerRestoreBackup(c *gin.Context) {
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
 		s.Events().Publish(server.BackupRestoreCompletedEvent, "")
 		logger.Info("completed server restoration from S3 backup")
-		s.SetRestoring(false)
 	}(s, c.Param("backup"), logger)
 
 	hasError = false
@@ -196,4 +207,90 @@ func deleteServerBackup(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// cancelServerBackup cancels a running backup operation for a server.
+// This endpoint allows clients to cancel backup operations that are currently in progress.
+func cancelServerBackup(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+	logger := middleware.ExtractLogger(c)
+	
+	backupID := c.Param("backup")
+	if backupID == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Backup ID is required",
+		})
+		return
+	}
+
+	registry := server.GetBackupOperationRegistry()
+	
+	// Get the operation to verify it belongs to this server
+	operation, exists := registry.Get(backupID)
+	if !exists {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": "Backup operation not found or already completed",
+		})
+		return
+	}
+	
+	// Verify the operation belongs to this server
+	if operation.ServerID != s.ID() {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"error": "Backup operation does not belong to this server",
+		})
+		return
+	}
+
+	// Cancel the operation
+	if err := registry.Cancel(backupID); err != nil {
+		logger.WithField("backup_id", backupID).WithError(err).Error("failed to cancel backup operation")
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	logger.WithFields(log.Fields{
+		"backup_id": backupID,
+		"server":    s.ID(),
+		"type":      operation.Type,
+	}).Info("backup operation cancelled via API")
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Backup operation cancelled successfully",
+	})
+}
+
+// getServerBackupOperations returns all currently running backup operations for a server.
+// This endpoint allows clients to see what backup/restore operations are currently active.
+func getServerBackupOperations(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+	registry := server.GetBackupOperationRegistry()
+	
+	operations := registry.List(s.ID())
+	
+	// Convert operations to JSON-safe format
+	type OperationResponse struct {
+		ID        string                `json:"id"`
+		BackupID  string                `json:"backup_id"`
+		Type      server.OperationType  `json:"type"`
+		StartTime int64                 `json:"start_time"`
+	}
+	
+	var response []OperationResponse
+	for _, op := range operations {
+		opResponse := OperationResponse{
+			ID:        op.ID,
+			BackupID:  op.BackupID,
+			Type:      op.Type,
+			StartTime: op.StartTime,
+		}
+		
+		response = append(response, opResponse)
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"operations": response,
+		"count":      len(response),
+	})
 }
