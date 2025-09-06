@@ -16,10 +16,12 @@ const (
 )
 
 const (
-	ProcessOfflineState  = "offline"
-	ProcessStartingState = "starting"
-	ProcessRunningState  = "running"
-	ProcessStoppingState = "stopping"
+	ProcessOfflineState     = "offline"
+	ProcessStartingState    = "starting"
+	ProcessRunningState     = "running"
+	ProcessStoppingState    = "stopping"
+	ProcessBackupState      = "backup"
+	ProcessRestoringState   = "restore"
 )
 
 // Defines the basic interface that all environments need to implement so that

@@ -10,6 +10,7 @@ import (
 // SimpleProgressTracker - ultra-lightweight progress tracking with ZERO overhead
 type SimpleProgressTracker struct {
 	server     *Server
+	backupID   string
 	backupType string
 	progress   *progress.Progress
 	lastSent   int64 // Last percentage sent
@@ -18,6 +19,7 @@ type SimpleProgressTracker struct {
 
 // BackupProgressUpdate represents the data sent over WebSocket
 type BackupProgressUpdate struct {
+	BackupID     string `json:"backup_id"`
 	Type         string `json:"type"`
 	Percentage   int    `json:"percentage"`
 	BytesWritten int64  `json:"bytes_written,omitempty"`
@@ -77,6 +79,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 			}
 			
 			update := BackupProgressUpdate{
+				BackupID:     spt.backupID,
 				Type:         spt.backupType,
 				Percentage:   p,
 				BytesWritten: w,
@@ -102,6 +105,7 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 	}
 	
 	update := BackupProgressUpdate{
+		BackupID:     spt.backupID,
 		Type:         spt.backupType,
 		Percentage:   percentage,
 		BytesWritten: written,

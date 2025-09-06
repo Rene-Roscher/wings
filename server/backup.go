@@ -57,10 +57,29 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 	return string(b), nil
 }
 
+// determineActualServerState checks the real container state and returns the appropriate Wings state
+func (s *Server) determineActualServerState() string {
+	// The most reliable way: check if the container is actually running right now
+	if running, err := s.Environment.IsRunning(s.Context()); err == nil && running {
+		return environment.ProcessRunningState
+	}
+	
+	return environment.ProcessOfflineState
+}
+
 // Backup performs a server backup and then emits the event over the server
 // websocket. We let the actual backup system handle notifying the panel of the
 // status, but that won't emit a websocket event.
 func (s *Server) Backup(b backup.BackupInterface) error {
+	// Set backup state to show in frontend via WebSocket
+	s.Environment.SetState(environment.ProcessBackupState)
+	
+	// Restore actual current state when backup is done
+	defer func() {
+		// Determine what the server state SHOULD be right now by checking actual container state
+		actualState := s.determineActualServerState()
+		s.Environment.SetState(actualState)
+	}()
 	ignored := b.Ignored()
 	if b.Ignored() == "" {
 		if i, err := s.getServerwideIgnoredFiles(); err != nil {
@@ -76,6 +95,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	// Simple progress tracker without goroutines
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
+		backupID:   b.Identifier(),
 		backupType: "create",
 		progress:   progressInstance,
 	}
@@ -164,11 +184,16 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 // In addition to the websocket event an API call is triggered to notify the
 // Panel of the new state.
 func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (err error) {
+	// Set restoring state to show in frontend via WebSocket
+	s.Environment.SetState(environment.ProcessRestoringState)
+	
 	s.Config().SetSuspended(true)
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
 	defer func() {
 		s.Config().SetSuspended(false)
+		// After restore, server should always be offline (restore requires server stop)
+		s.Environment.SetState(environment.ProcessOfflineState)
 		if reader != nil {
 			_ = reader.Close()
 		}
@@ -208,6 +233,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
+		backupID:   b.Identifier(),
 		backupType: "restore",
 		progress:   restoreProgress, // Real progress instance!
 	}

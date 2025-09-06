@@ -200,7 +200,9 @@ func (e *Environment) SetState(state string) {
 	if state != environment.ProcessOfflineState &&
 		state != environment.ProcessStartingState &&
 		state != environment.ProcessRunningState &&
-		state != environment.ProcessStoppingState {
+		state != environment.ProcessStoppingState &&
+		state != environment.ProcessBackupState &&
+		state != environment.ProcessRestoringState {
 		panic(errors.New(fmt.Sprintf("invalid server state received: %s", state)))
 	}
 
