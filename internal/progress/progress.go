@@ -18,6 +18,9 @@ type Progress struct {
 
 	// Writer .
 	Writer io.Writer
+	
+	// ProgressCallback - optional callback for progress updates (ultra-lightweight)
+	ProgressCallback func()
 }
 
 // NewProgress returns a new progress tracker for the given total size.
@@ -48,6 +51,18 @@ func (p *Progress) SetTotal(total uint64) {
 func (p *Progress) Write(v []byte) (int, error) {
 	n := len(v)
 	atomic.AddUint64(&p.written, uint64(n))
+	
+	// Ultra-lightweight progress callback (no overhead if nil)
+	// CRITICAL: Never let progress callback break the backup process
+	if p.ProgressCallback != nil {
+		func() {
+			defer func() {
+				recover() // Silent recovery - progress callback failures must never break backups
+			}()
+			p.ProgressCallback()
+		}()
+	}
+	
 	if p.Writer != nil {
 		return p.Writer.Write(v)
 	}

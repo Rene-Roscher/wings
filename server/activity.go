@@ -68,7 +68,7 @@ func (s *Server) SaveActivity(a RequestActivity, event models.Event, metadata mo
 		}
 	}()
 
-	// Publish activity as event over WebSocket (async to avoid blocking)
+	// Publish activity as event over WebSocket (async but throttled)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

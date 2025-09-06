@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
@@ -11,8 +12,10 @@ import (
 	"github.com/docker/docker/client"
 
 	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/internal/progress"
 	"github.com/Rene-Roscher/wings/remote"
 	"github.com/Rene-Roscher/wings/server/backup"
+	"github.com/Rene-Roscher/wings/server/filesystem"
 )
 
 // Notifies the panel of a backup's state and returns an error if one is encountered
@@ -67,8 +70,23 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		}
 	}
 
-	ad, err := b.Generate(s.Context(), s.Filesystem(), ignored)
+	// Ultra-simple progress tracking using existing Archive.Progress system
+	progressInstance := progress.NewProgress(0)
+	
+	// Simple progress tracker without goroutines
+	progressTracker := &SimpleProgressTracker{
+		server:     s,
+		backupType: "create",
+		progress:   progressInstance,
+	}
+	
+	// Connect progress callback - called on every Archive.Write()!
+	progressInstance.ProgressCallback = progressTracker.CheckProgress
+
+	// NO DiskUsage() - too expensive! Let Archive.Write() update progress naturally
+	ad, err := s.generateBackupWithProgress(b, ignored, progressInstance, progressTracker)
 	if err != nil {
+		progressTracker.SendFinalProgress(false) // Send error progress
 		if err := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); err != nil {
 			s.Log().WithFields(log.Fields{
 				"backup": b.Identifier(),
@@ -99,6 +117,8 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	} else {
 		s.Log().WithField("backup", b.Identifier()).Info("notified panel of successful backup state")
 	}
+
+	progressTracker.SendFinalProgress(true) // Send success progress
 
 	// Emit an event over the socket so we can update the backup in realtime on
 	// the frontend for the server.
@@ -148,12 +168,45 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		}
 	}
 
+	// Ultra-simple restore progress tracking
+	var processedFiles int64
+	
+	progressTracker := &SimpleProgressTracker{
+		server:     s,
+		backupType: "restore",
+		progress:   nil, // No progress instance for restore (file-based)
+	}
+
+	updateProgress := func() {
+		current := atomic.AddInt64(&processedFiles, 1)
+		// Show progress every 10 files to avoid spam
+		if current%10 == 0 {
+			// Send simple file count update
+			update := BackupProgressUpdate{
+				Type:         "restore",
+				Percentage:   0, // No percentage for restore
+				BytesWritten: current,
+				BytesTotal:   0,
+			}
+			
+			// Async send to avoid blocking
+			go func() {
+				defer func() { recover() }() // Silent recovery
+				s.Events().Publish(BackupProgressEvent, update)
+			}()
+		}
+	}
+
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+
+		// Update progress for each file processed
+		defer updateProgress()
+
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
@@ -164,5 +217,55 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
 
+	// Send final progress update
+	progressTracker.SendFinalProgress(err == nil)
+
 	return errors.WithStackIf(err)
+}
+
+// generateBackupWithProgress creates a backup with progress tracking
+func (s *Server) generateBackupWithProgress(b backup.BackupInterface, ignored string, progressInstance *progress.Progress, tracker *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
+	// For local backups, we need to inject the progress tracker into the archive
+	if localBackup, ok := b.(*backup.LocalBackup); ok {
+		return s.generateLocalBackupWithProgress(localBackup, ignored, progressInstance)
+	}
+
+	// For S3 backups, we also need progress tracking
+	if s3Backup, ok := b.(*backup.S3Backup); ok {
+		return s.generateS3BackupWithProgress(s3Backup, ignored, progressInstance)
+	}
+
+	// Fallback to original Generate method if backup type is unknown
+	return b.Generate(s.Context(), s.Filesystem(), ignored)
+}
+
+// generateLocalBackupWithProgress creates a local backup with progress tracking
+func (s *Server) generateLocalBackupWithProgress(b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
+	a := &filesystem.Archive{
+		Filesystem: s.Filesystem(),
+		Ignore:     ignored,
+		Progress:   progressInstance, // Inject progress tracker
+	}
+
+	s.Log().WithField("backup", b.Identifier()).WithField("path", b.Path()).Info("creating backup for server")
+	if err := a.Create(s.Context(), b.Path()); err != nil {
+		return nil, err
+	}
+	s.Log().WithField("backup", b.Identifier()).Info("created backup successfully")
+
+	ad, err := b.Details(s.Context(), nil)
+	if err != nil {
+		return nil, errors.WrapIf(err, "backup: failed to get archive details for local backup")
+	}
+	return ad, nil
+}
+
+// generateS3BackupWithProgress creates an S3 backup with progress tracking
+func (s *Server) generateS3BackupWithProgress(b *backup.S3Backup, ignored string, _ *progress.Progress) (*backup.ArchiveDetails, error) {
+	// Work WITH the source: S3Backup.Generate already handles everything correctly
+	// Avoid double-creation by letting the original S3 flow work unmodified
+	// 
+	// Future improvement: Extend backup package to support progress callbacks natively
+	// For now: Accept that S3 progress tracking is limited, but backup works correctly
+	return b.Generate(s.Context(), s.Filesystem(), ignored)
 }
