@@ -61,6 +61,7 @@ type Server struct {
 	installing   *system.AtomicBool
 	transferring *system.AtomicBool
 	restoring    *system.AtomicBool
+	backingUp    *system.AtomicBool
 
 	// The console throttler instance used to control outputs.
 	throttler    *ConsoleThrottle
@@ -87,6 +88,7 @@ func New(client remote.Client) (*Server, error) {
 		installing:   system.NewAtomicBool(false),
 		transferring: system.NewAtomicBool(false),
 		restoring:    system.NewAtomicBool(false),
+		backingUp:    system.NewAtomicBool(false),
 		powerLock:    system.NewLocker(),
 		sinks: map[system.SinkName]*system.SinkPool{
 			system.LogSink:     system.NewSinkPool(),

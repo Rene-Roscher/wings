@@ -376,13 +376,14 @@ func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
 		threads = 3
 	}
 
-	// Map compression level from config
+	// Map compression level from config with optimal ZSTD settings
 	var level zstd.EncoderLevel
 	switch config.Get().System.Backups.CompressionLevel {
 	case "none":
 		return &nopWriteCloser{w}, nil
 	case "best_speed":
-		level = zstd.SpeedFastest
+		// FIXED: Use SpeedBetterCompression instead of SpeedFastest for better ratio
+		level = zstd.SpeedBetterCompression // Better balance: still fast but much better compression
 	case "best_compression":
 		level = zstd.SpeedBestCompression
 	default:
@@ -392,8 +393,8 @@ func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
 	return zstd.NewWriter(w,
 		zstd.WithEncoderLevel(level),
 		zstd.WithEncoderConcurrency(threads),
-		zstd.WithLowerEncoderMem(true),          // Reduce memory usage
-		zstd.WithAllLitEntropyCompression(true), // Better compression
+		zstd.WithLowerEncoderMem(true), // Reduce memory usage
+		// Removed WithAllLitEntropyCompression - can cause compatibility issues
 	)
 }
 

@@ -69,6 +69,60 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	
+	// Smart brute force protection configuration
+	Security SftpSecurityConfiguration `yaml:"security"`
+}
+
+// SftpSecurityConfiguration defines intelligent brute force protection settings
+type SftpSecurityConfiguration struct {
+	// Enable/disable brute force protection
+	Enabled bool `default:"true" yaml:"enabled"`
+	
+	// Base thresholds for triggering blocks
+	Thresholds SftpSecurityThresholds `yaml:"thresholds"`
+	
+	// Block duration strategy
+	Blocking SftpBlockingStrategy `yaml:"blocking"`
+	
+	// Reputation system settings
+	Reputation SftpReputationConfig `yaml:"reputation"`
+}
+
+// SftpSecurityThresholds defines when to start blocking
+type SftpSecurityThresholds struct {
+	// Attempts per minute before first block (smart: 6+ = 5min)
+	AttemptsPerMinute int `default:"6" yaml:"attempts_per_minute"`
+	// Attempts per hour before escalated blocking
+	AttemptsPerHour int `default:"15" yaml:"attempts_per_hour"`
+	// Attempts per day before long-term reputation impact
+	AttemptsPerDay int `default:"50" yaml:"attempts_per_day"`
+}
+
+// SftpBlockingStrategy defines how blocks escalate intelligently
+type SftpBlockingStrategy struct {
+	// Base block duration in minutes (smart: starts at 5min)
+	BaseBlockMinutes int `default:"5" yaml:"base_block_minutes"`
+	// Exponential multiplier for repeat offenders (smart: 2x each time)
+	EscalationFactor float64 `default:"2.0" yaml:"escalation_factor"`
+	// Maximum block duration in hours (smart: caps at reasonable limit)
+	MaxBlockHours int `default:"24" yaml:"max_block_hours"`
+	// Decay factor - how much blocks reduce over time (smart: forgiveness)
+	DecayFactor float64 `default:"0.8" yaml:"decay_factor"`
+}
+
+// SftpReputationConfig defines IP reputation tracking
+type SftpReputationConfig struct {
+	// Track reputation history
+	Enabled bool `default:"true" yaml:"enabled"`
+	// Days to remember IP behavior
+	MemoryDays int `default:"7" yaml:"memory_days"`
+	// Score threshold for immediate blocking (-100 to +100)
+	BlockThreshold int `default:"-50" yaml:"block_threshold"`
+	// Good behavior bonus (successful logins)
+	GoodBehaviorBonus int `default:"5" yaml:"good_behavior_bonus"`
+	// Bad behavior penalty (failed attempts)
+	BadBehaviorPenalty int `default:"-10" yaml:"bad_behavior_penalty"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is

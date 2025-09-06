@@ -56,22 +56,28 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	var shouldSend bool
 	lastSent := atomic.LoadInt64(&spt.lastSent)
 
+	// TIME-BASED THROTTLING: Only send events maximum every 250ms to prevent WebSocket flooding
+	const throttleIntervalNanos = 250_000_000 // 250ms in nanoseconds
+	shouldSendByTime := (now - atomic.LoadInt64(&spt.lastTime)) >= throttleIntervalNanos
+
 	if total > 0 {
-		// Percentage mode - very responsive
+		// Percentage mode - responsive but throttled
 		percentage = min(100, int((written*100)/total))
-		// Send on ANY percentage increase (1%, 2%, 3%... super live!)
-		shouldSend = percentage > int(lastSent)
+		// Send on percentage increase AND time throttle
+		percentageChanged := percentage > int(lastSent)
+		shouldSend = percentageChanged && shouldSendByTime
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, int64(percentage))
 		}
 	} else {
-		// Byte mode - show every 512KB for max liveness without spam
+		// Byte mode - show progress in 1MB chunks with time throttling  
 		percentage = -1
-		lastKB := lastSent
-		currentKB := written / (512 * 1024) // 512KB chunks = very live
-		shouldSend = currentKB > lastKB
+		lastMB := lastSent
+		currentMB := written / (1024 * 1024) // 1MB chunks with time throttling
+		dataChanged := currentMB > lastMB
+		shouldSend = dataChanged && shouldSendByTime
 		if shouldSend {
-			atomic.StoreInt64(&spt.lastSent, currentKB)
+			atomic.StoreInt64(&spt.lastSent, currentMB)
 		}
 	}
 

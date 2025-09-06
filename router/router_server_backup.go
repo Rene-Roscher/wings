@@ -22,6 +22,20 @@ func postServerBackup(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	client := middleware.ExtractApiClient(c)
 	logger := middleware.ExtractLogger(c)
+
+	// RACE CONDITION PROTECTION: Prevent concurrent operations
+	if s.IsBackingUp() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A backup operation is already running for this server",
+		})
+		return
+	}
+	if s.IsRestoring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A restore operation is already running for this server",
+		})
+		return
+	}
 	var data struct {
 		Adapter backup.AdapterType `json:"adapter"`
 		Uuid    string             `json:"uuid"`
@@ -84,6 +98,20 @@ func postServerRestoreBackup(c *gin.Context) {
 	client := middleware.ExtractApiClient(c)
 	logger := middleware.ExtractLogger(c)
 
+	// RACE CONDITION PROTECTION: Prevent concurrent operations
+	if s.IsBackingUp() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A backup operation is already running for this server",
+		})
+		return
+	}
+	if s.IsRestoring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A restore operation is already running for this server",
+		})
+		return
+	}
+
 	var data struct {
 		Adapter           backup.AdapterType `binding:"required,oneof=wings s3" json:"adapter"`
 		TruncateDirectory bool               `json:"truncate_directory"`
@@ -125,9 +153,21 @@ func postServerRestoreBackup(c *gin.Context) {
 			return
 		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
-			defer s.SetRestoring(false) // Ensure restoring state is always reset
+			// Register restore operation for cancellation support
+			registry := server.GetBackupOperationRegistry()
+			_, ctx, cancel := registry.Register(c.Param("backup"), s.ID(), server.OperationTypeRestore)
+			defer func() {
+				cancel()
+				registry.Complete(c.Param("backup"))
+				s.SetRestoring(false) // Ensure restoring state is always reset
+			}()
+
+			// Add 4-hour timeout for restore operations
+			ctx, timeoutCancel := context.WithTimeout(ctx, 4*time.Hour)
+			defer timeoutCancel()
+
 			logger.Info("starting restoration process for server backup using local driver")
-			if err := s.RestoreBackup(b, nil); err != nil {
+			if err := s.RestoreBackupWithContext(ctx, b, nil); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
 			}
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
@@ -168,9 +208,21 @@ func postServerRestoreBackup(c *gin.Context) {
 	}
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
-		defer s.SetRestoring(false) // Ensure restoring state is always reset
+		// Register restore operation for cancellation support
+		registry := server.GetBackupOperationRegistry()
+		_, ctx, cancel := registry.Register(uuid, s.ID(), server.OperationTypeRestore)
+		defer func() {
+			cancel()
+			registry.Complete(uuid)
+			s.SetRestoring(false) // Ensure restoring state is always reset
+		}()
+
+		// Add 4-hour timeout for restore operations
+		ctx, timeoutCancel := context.WithTimeout(ctx, 4*time.Hour)
+		defer timeoutCancel()
+
 		logger.Info("starting restoration process for server backup using S3 driver")
-		if err := s.RestoreBackup(backup.NewS3(client, uuid, ""), res.Body); err != nil {
+		if err := s.RestoreBackupWithContext(ctx, backup.NewS3(client, uuid, ""), res.Body); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")

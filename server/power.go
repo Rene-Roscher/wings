@@ -54,8 +54,10 @@ func (s *Server) ExecutingPowerAction() bool {
 // function rather than making direct calls to the start/stop/restart functions on the
 // environment struct.
 func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error {
-	if s.IsInstalling() || s.IsTransferring() || s.IsRestoring() {
-		if s.IsRestoring() {
+	if s.IsInstalling() || s.IsTransferring() || s.IsRestoring() || s.IsBackingUp() {
+		if s.IsBackingUp() {
+			return ErrServerIsBackingUp
+		} else if s.IsRestoring() {
 			return ErrServerIsRestoring
 		} else if s.IsTransferring() {
 			return ErrServerIsTransferring

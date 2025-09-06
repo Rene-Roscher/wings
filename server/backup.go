@@ -80,16 +80,31 @@ func (s *Server) determineActualServerState() string {
 
 // BackupWithContext performs a server backup with context support for cancellation.
 // This method respects context cancellation at every I/O operation following CLAUDE.md guidelines.
+// CRITICAL: This method MUST use the provided context from BackupOperationRegistry for proper cancellation
 func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface) error {
-	// Set reasonable timeout if none provided - 6 hours for backup as per CLAUDE.md
+	// IMPORTANT: Don't override timeout if context already has deadline (from registry)
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 6*time.Hour)
 		defer cancel()
+		s.Log().Debug("backup context: applied 6-hour timeout (no existing deadline)")
+	} else {
+		s.Log().Debug("backup context: using provided context with existing deadline")
 	}
 	
 	// Context-aware operation wrapper
 	ctxDone := ctx.Done()
+	
+	// CRITICAL: Ensure this backup is properly registered in operation registry
+	registry := GetBackupOperationRegistry()
+	if _, exists := registry.Get(b.Identifier()); !exists {
+		// This should not happen in normal operation - backup should be pre-registered
+		s.Log().WithField("backup_id", b.Identifier()).Warn("backup operation not found in registry - this may cause cancellation issues")
+	} else {
+		s.Log().WithField("backup_id", b.Identifier()).Debug("backup operation confirmed in registry")
+	}
+	
+	// Note: Registry completion is handled by the caller (router layer)
 	
 	// Check for context cancellation before proceeding
 	select {
@@ -101,9 +116,13 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	// Atomic state transition to backup state
 	previousState := s.Environment.State()
 	s.Environment.SetState(environment.ProcessBackupState)
+	s.SetBackingUp(true)
 
 	// Restore proper state when backup is done - context-aware
 	defer func() {
+		// Always reset backup state first
+		s.SetBackingUp(false)
+		
 		// Check if context was cancelled to determine appropriate final state
 		if errors.Is(ctx.Err(), context.Canceled) {
 			// Backup was cancelled - restore previous state if it was stable
@@ -315,7 +334,9 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 //
 // In addition to the websocket event an API call is triggered to notify the
 // Panel of the new state.
-func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (err error) {
+// RestoreBackupWithContext performs a server backup restore with context for cancellation support.
+// This is the primary restore function that should be used for all restore operations.
+func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupInterface, reader io.ReadCloser) (err error) {
 	s.Config().SetSuspended(true)
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
@@ -340,29 +361,48 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// instance, otherwise you'll likely hit all types of write errors due to the
 	// server being suspended.
 	if s.Environment.State() != environment.ProcessOfflineState {
-		if err = s.Environment.WaitForStop(s.Context(), 2*time.Minute, false); err != nil {
+		if err = s.Environment.WaitForStop(ctx, 2*time.Minute, false); err != nil {
 			if !errdefs.IsNotFound(err) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}
 		}
 	}
 
+	// Check for cancellation after stopping server
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	// Atomic transition to restore state after server is guaranteed to be stopped
 	s.Environment.SetState(environment.ProcessRestoringState)
 
-	// Auto-detect compression format and create appropriate decompressor
-	format, detectedReader, err := filesystem.DetectCompressionFormat(reader)
-	if err != nil {
-		return errors.WrapIf(err, "failed to detect backup format")
-	}
-	reader = detectedReader
+	// Handle different restore scenarios
+	var decompressedReader io.ReadCloser
+	
+	if reader == nil {
+		// LOCAL BACKUP RESTORE: reader is nil, backup interface handles decompression
+		s.Log().Debug("performing local backup restore - backup interface handles decompression")
+		decompressedReader = nil // Will be handled by backup.Restore() method
+	} else {
+		// REMOTE BACKUP RESTORE: we need to detect format and decompress
+		s.Log().Debug("performing remote backup restore - detecting compression format")
+		
+		// Auto-detect compression format and create appropriate decompressor
+		format, detectedReader, err := filesystem.DetectCompressionFormat(reader)
+		if err != nil {
+			return errors.WrapIf(err, "failed to detect backup format")
+		}
+		reader = detectedReader
 
-	// Create decompressor based on detected format
-	decompressedReader, err := filesystem.CreateDecompressor(reader, format)
-	if err != nil {
-		return errors.WrapIf(err, "failed to create decompressor")
+		// Create decompressor based on detected format
+		decompressedReader, err = filesystem.CreateDecompressor(reader, format)
+		if err != nil {
+			return errors.WrapIf(err, "failed to create decompressor")
+		}
+		defer decompressedReader.Close()
 	}
-	defer decompressedReader.Close()
 
 	// Restore progress tracking with real Progress instance
 	var processedFiles int64
@@ -378,7 +418,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
 	}
 
-	progressTracker := NewSimpleProgressTracker(s.Context(), s, b.Identifier(), "restore", restoreProgress)
+	progressTracker := NewSimpleProgressTracker(ctx, s, b.Identifier(), "restore", restoreProgress)
 	defer progressTracker.Close() // Ensure cleanup
 
 	// Connect callback for percentage tracking
@@ -400,7 +440,16 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	err = b.Restore(s.Context(), decompressedReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
+	
+	// For local backups, pass the original reader (backup interface handles decompression)
+	// For remote backups, pass the decompressed reader
+	restoreReader := decompressedReader
+	if reader == nil {
+		// Local backup: let backup interface handle its own file reading
+		restoreReader = nil
+	}
+	
+	err = b.Restore(ctx, restoreReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 
@@ -422,6 +471,12 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	progressTracker.SendFinalProgress(err == nil)
 
 	return errors.WithStackIf(err)
+}
+
+// RestoreBackup performs a server backup restore with the server's context.
+// This method is kept for backward compatibility. New code should use RestoreBackupWithContext.
+func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) error {
+	return s.RestoreBackupWithContext(s.Context(), b, reader)
 }
 
 // generateBackupWithProgress creates a backup with progress tracking and context support

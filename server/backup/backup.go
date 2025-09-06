@@ -109,6 +109,14 @@ func (b *Backup) Path() string {
 	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+extension)
 }
 
+// PathForLocalBackup returns the path for a LocalBackup, checking for foundPath override
+func (b *Backup) PathForLocalBackup(foundPath string) string {
+	if foundPath != "" {
+		return foundPath // Use discovered path for backward compatibility
+	}
+	return b.Path() // Use standard path generation
+}
+
 // Size returns the size of the generated backup.
 func (b *Backup) Size() (int64, error) {
 	st, err := os.Stat(b.Path())

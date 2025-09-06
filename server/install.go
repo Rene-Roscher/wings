@@ -159,6 +159,14 @@ func (s *Server) SetRestoring(state bool) {
 	s.restoring.Store(state)
 }
 
+func (s *Server) IsBackingUp() bool {
+	return s.backingUp.Load()
+}
+
+func (s *Server) SetBackingUp(state bool) {
+	s.backingUp.Store(state)
+}
+
 // RemoveContainer removes the installation container for the server.
 func (ip *InstallationProcess) RemoveContainer() error {
 	err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", container.RemoveOptions{
