@@ -17,7 +17,7 @@ type eventHandler struct {
 	ip        string
 	user      string
 	server    string
-	publisher EventPublisher  // Interface to publish events
+	publisher EventPublisher // Interface to publish events
 }
 
 type FileAction struct {
@@ -53,7 +53,7 @@ func (eh *eventHandler) Log(e models.Event, fa FileAction) error {
 	if tx := database.Instance().Create(a.SetUser(eh.user)); tx.Error != nil {
 		return errors.WithStack(tx.Error)
 	}
-	
+
 	// Publish activity as event over WebSocket (async to avoid blocking)
 	if eh.publisher != nil {
 		go func() {
@@ -69,7 +69,7 @@ func (eh *eventHandler) Log(e models.Event, fa FileAction) error {
 			})
 		}()
 	}
-	
+
 	return nil
 }
 

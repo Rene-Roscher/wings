@@ -35,20 +35,20 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	// Ultra-fast check: only proceed if enough time passed (no expensive operations)
 	now := time.Now().UnixNano()
 	lastTime := atomic.LoadInt64(&spt.lastTime)
-	
+
 	// Smart throttling: 200ms for super-live feel, but not spam
 	if (now - lastTime) < 200*1000000 { // 200ms = super live
 		return
 	}
-	
+
 	// Only load values if we might send an update (performance!)
 	written := int64(spt.progress.Written())
 	total := int64(spt.progress.Total())
-	
+
 	var percentage int
 	var shouldSend bool
 	lastSent := atomic.LoadInt64(&spt.lastSent)
-	
+
 	if total > 0 {
 		// Percentage mode - very responsive
 		percentage = min(100, int((written*100)/total))
@@ -60,24 +60,24 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	} else {
 		// Byte mode - show every 512KB for max liveness without spam
 		percentage = -1
-		lastKB := lastSent 
+		lastKB := lastSent
 		currentKB := written / (512 * 1024) // 512KB chunks = very live
 		shouldSend = currentKB > lastKB
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, currentKB)
 		}
 	}
-	
+
 	if shouldSend {
 		atomic.StoreInt64(&spt.lastTime, now)
-		
+
 		// Ultra-fast async send (no defer overhead)
 		go func(p int, w, t int64) {
 			// Minimal recovery overhead
 			if r := recover(); r != nil {
 				return
 			}
-			
+
 			update := BackupProgressUpdate{
 				BackupID:     spt.backupID,
 				Type:         spt.backupType,
@@ -85,7 +85,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 				BytesWritten: w,
 				BytesTotal:   t,
 			}
-			
+
 			spt.server.Events().Publish(BackupProgressEvent, update)
 		}(percentage, written, total)
 	}
@@ -97,13 +97,13 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 	if !success {
 		percentage = -1 // Error indicator
 	}
-	
+
 	var written, total int64
 	if spt.progress != nil {
 		written = int64(spt.progress.Written())
 		total = int64(spt.progress.Total())
 	}
-	
+
 	update := BackupProgressUpdate{
 		BackupID:     spt.backupID,
 		Type:         spt.backupType,
@@ -111,7 +111,7 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		BytesWritten: written,
 		BytesTotal:   total,
 	}
-	
+
 	// Send final progress (async to never break backup process)
 	go func() {
 		defer func() {

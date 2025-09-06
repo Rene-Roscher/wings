@@ -7,12 +7,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/juju/ratelimit"
+	"github.com/klauspost/compress/zstd"
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
 
@@ -129,25 +131,24 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		a.Files = files
 	}
 
-	// Choose which compression level to use based on the compression_level configuration option
-	var compressionLevel int
-	switch config.Get().System.Backups.CompressionLevel {
-	case "none":
-		compressionLevel = pgzip.NoCompression
-	case "best_compression":
-		compressionLevel = pgzip.BestCompression
-	default:
-		compressionLevel = pgzip.BestSpeed
+	// Create compressor based on configured format
+	compressor, err := a.createCompressor(w)
+	if err != nil {
+		return errors.Wrap(err, "failed to create compressor")
 	}
+	defer func() {
+		if err := compressor.Close(); err != nil {
+			log.WithError(err).Warn("failed to close compressor")
+		}
+	}()
 
-	// Create a new gzip writer around the file.
-	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
-	_ = gw.SetConcurrency(1<<20, 1)
-	defer gw.Close()
-
-	// Create a new tar writer around the gzip writer.
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
+	// Create a new tar writer around the compressor.
+	tw := tar.NewWriter(compressor)
+	defer func() {
+		if err := tw.Close(); err != nil {
+			log.WithError(err).Warn("failed to close tar writer")
+		}
+	}()
 
 	a.w = NewTarProgress(tw, a.Progress)
 
@@ -340,5 +341,89 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
+	return nil
+}
+
+// createCompressor creates the appropriate compressor based on the configured format
+func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
+	// Apply rate limiting if configured
+	var writer io.Writer = w
+	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
+		writer = ratelimit.Writer(writer, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+	}
+
+	// Choose compressor based on format setting
+	switch config.Get().System.Backups.Format {
+	case "zstd":
+		return a.createZstdWriter(writer)
+	case "gzip":
+		return a.createGzipWriter(writer)
+	case "none":
+		return &nopWriteCloser{writer}, nil
+	default:
+		// Default to gzip for backward compatibility
+		return a.createGzipWriter(writer)
+	}
+}
+
+// createZstdWriter creates a zstd compressor with optimal settings
+func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
+	// Calculate optimal thread count (max 4, based on CPU count)
+	threads := 2
+	if cpus := runtime.NumCPU(); cpus >= 9 {
+		threads = 4
+	} else if cpus >= 5 {
+		threads = 3
+	}
+
+	// Map compression level from config
+	var level zstd.EncoderLevel
+	switch config.Get().System.Backups.CompressionLevel {
+	case "none":
+		return &nopWriteCloser{w}, nil
+	case "best_speed":
+		level = zstd.SpeedFastest
+	case "best_compression":
+		level = zstd.SpeedBestCompression
+	default:
+		level = zstd.SpeedBetterCompression // Good balance
+	}
+
+	return zstd.NewWriter(w,
+		zstd.WithEncoderLevel(level),
+		zstd.WithEncoderConcurrency(threads),
+		zstd.WithLowerEncoderMem(true),          // Reduce memory usage
+		zstd.WithAllLitEntropyCompression(true), // Better compression
+	)
+}
+
+// createGzipWriter creates a gzip compressor with existing logic
+func (a *Archive) createGzipWriter(w io.Writer) (io.WriteCloser, error) {
+	// Choose which compression level to use based on the compression_level configuration option
+	var compressionLevel int
+	switch config.Get().System.Backups.CompressionLevel {
+	case "none":
+		compressionLevel = pgzip.NoCompression
+	case "best_compression":
+		compressionLevel = pgzip.BestCompression
+	default:
+		compressionLevel = pgzip.BestSpeed
+	}
+
+	// Create a new gzip writer around the writer.
+	gw, err := pgzip.NewWriterLevel(w, compressionLevel)
+	if err != nil {
+		return nil, err
+	}
+	_ = gw.SetConcurrency(1<<20, 1)
+	return gw, nil
+}
+
+// nopWriteCloser wraps an io.Writer to provide a no-op Close method
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nwc *nopWriteCloser) Close() error {
 	return nil
 }

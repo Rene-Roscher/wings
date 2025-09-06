@@ -93,7 +93,20 @@ func (b *Backup) Identifier() string {
 
 // Path returns the path for this specific backup.
 func (b *Backup) Path() string {
-	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+".tar.gz")
+	// Generate extension based on backup format
+	var extension string
+	switch config.Get().System.Backups.Format {
+	case "zstd":
+		extension = ".tar.zst"
+	case "gzip":
+		extension = ".tar.gz"
+	case "none":
+		extension = ".tar"
+	default:
+		extension = ".tar.gz" // Default to gzip for backward compatibility
+	}
+
+	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+extension)
 }
 
 // Size returns the size of the generated backup.

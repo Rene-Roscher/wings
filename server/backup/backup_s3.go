@@ -49,7 +49,13 @@ func (s *S3Backup) WithLogContext(c map[string]interface{}) {
 // Generate creates a new backup on the disk, moves it into the S3 bucket via
 // the provided presigned URL, and then deletes the backup from the disk.
 func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
-	defer s.Remove()
+	success := false
+	defer func() {
+		if success {
+			s.Remove() // Only remove on successful upload
+		}
+		// On failure, backup file is kept for debugging/retry
+	}()
 
 	a := &filesystem.Archive{
 		Filesystem: fsys,
@@ -76,6 +82,8 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	if err != nil {
 		return nil, errors.WrapIf(err, "backup: failed to get archive details after upload")
 	}
+
+	success = true // Mark as successful for cleanup
 	return ad, nil
 }
 
@@ -119,7 +127,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	s.log().WithField("size", size).Debug("got size of backup")
 
 	s.log().Debug("attempting to get S3 upload urls from Panel...")
-	urls, err := s.client.GetBackupRemoteUploadURLs(context.Background(), s.Backup.Uuid, size)
+	urls, err := s.client.GetBackupRemoteUploadURLs(ctx, s.Backup.Uuid, size)
 	if err != nil {
 		return nil, err
 	}

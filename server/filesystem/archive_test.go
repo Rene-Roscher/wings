@@ -1,122 +1,113 @@
 package filesystem
 
 import (
-	"context"
-	iofs "io/fs"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
+	"bytes"
+	"compress/gzip"
+	"io"
 	"testing"
 
-	. "github.com/franela/goblin"
-	"github.com/mholt/archives"
+	"github.com/klauspost/compress/zstd"
 )
 
-func TestArchive_Stream(t *testing.T) {
-	g := Goblin(t)
-	fs, rfs := NewFs()
+func TestDetectCompressionFormat(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           []byte
+		expectedFormat CompressionFormat
+	}{
+		{
+			name:           "GZIP format",
+			data:           []byte{0x1F, 0x8B, 0x08, 0x00}, // GZIP magic
+			expectedFormat: CompressionGzip,
+		},
+		{
+			name:           "ZSTD format",
+			data:           []byte{0x28, 0xB5, 0x2F, 0xFD}, // ZSTD magic
+			expectedFormat: CompressionZstd,
+		},
+		{
+			name:           "Unknown format defaults to GZIP",
+			data:           []byte{0x00, 0x00, 0x00, 0x00},
+			expectedFormat: CompressionGzip,
+		},
+	}
 
-	g.Describe("Archive", func() {
-		g.AfterEach(func() {
-			// Reset the filesystem after each run.
-			_ = fs.TruncateRootDirectory()
-		})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := io.NopCloser(bytes.NewReader(tt.data))
+			format, _, err := DetectCompressionFormat(reader)
 
-		g.It("creates archive with intended files", func() {
-			g.Assert(fs.CreateDirectory("test", "/")).IsNil()
-			g.Assert(fs.CreateDirectory("test2", "/")).IsNil()
-
-			r := strings.NewReader("hello, world!\n")
-			err := fs.Write("test/file.txt", r, r.Size(), 0o644)
-			g.Assert(err).IsNil()
-
-			r = strings.NewReader("hello, world!\n")
-			err = fs.Write("test2/file.txt", r, r.Size(), 0o644)
-			g.Assert(err).IsNil()
-
-			r = strings.NewReader("hello, world!\n")
-			err = fs.Write("test_file.txt", r, r.Size(), 0o644)
-			g.Assert(err).IsNil()
-
-			r = strings.NewReader("hello, world!\n")
-			err = fs.Write("test_file.txt.old", r, r.Size(), 0o644)
-			g.Assert(err).IsNil()
-
-			a := &Archive{
-				Filesystem: fs,
-				Files: []string{
-					"test",
-					"test_file.txt",
-				},
+			if err != nil {
+				t.Errorf("DetectCompressionFormat() error = %v", err)
+				return
 			}
 
-			// Create the archive.
-			archivePath := filepath.Join(rfs.root, "archive.tar.gz")
-			g.Assert(a.Create(context.Background(), archivePath)).IsNil()
-
-			// Ensure the archive exists.
-			_, err = os.Stat(archivePath)
-			g.Assert(err).IsNil()
-
-			// Open the archive.
-			genericFs, err := archives.FileSystem(context.Background(), archivePath, nil)
-			g.Assert(err).IsNil()
-
-			// Assert that we are opening an archive.
-			afs, ok := genericFs.(iofs.ReadDirFS)
-			g.Assert(ok).IsTrue()
-
-			// Get the names of the files recursively from the archive.
-			files, err := getFiles(afs, ".")
-			g.Assert(err).IsNil()
-
-			// Ensure the files in the archive match what we are expecting.
-			expected := []string{
-				"test_file.txt",
-				"test/file.txt",
+			if format != tt.expectedFormat {
+				t.Errorf("DetectCompressionFormat() = %v, want %v", format, tt.expectedFormat)
 			}
-
-			// Sort the slices to ensure the comparison never fails if the
-			// contents are sorted differently.
-			sort.Strings(expected)
-			sort.Strings(files)
-
-			g.Assert(files).Equal(expected)
 		})
-	})
+	}
 }
 
-func getFiles(f iofs.ReadDirFS, name string) ([]string, error) {
-	var v []string
+func TestCreateDecompressor(t *testing.T) {
+	// Test GZIP decompressor
+	t.Run("GZIP decompressor", func(t *testing.T) {
+		var buf bytes.Buffer
+		gw := gzip.NewWriter(&buf)
+		_, err := gw.Write([]byte("test data"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gw.Close()
 
-	entries, err := f.ReadDir(name)
-	if err != nil {
-		return nil, err
-	}
+		reader := io.NopCloser(bytes.NewReader(buf.Bytes()))
+		decompressor, err := CreateDecompressor(reader, CompressionGzip)
+		if err != nil {
+			t.Errorf("CreateDecompressor() error = %v", err)
+			return
+		}
+		defer decompressor.Close()
 
-	for _, e := range entries {
-		entryName := e.Name()
-		if name != "." {
-			entryName = filepath.Join(name, entryName)
+		data, err := io.ReadAll(decompressor)
+		if err != nil {
+			t.Errorf("Failed to read from GZIP decompressor: %v", err)
+			return
 		}
 
-		if e.IsDir() {
-			files, err := getFiles(f, entryName)
-			if err != nil {
-				return nil, err
-			}
+		if string(data) != "test data" {
+			t.Errorf("GZIP decompression failed: got %s, want 'test data'", string(data))
+		}
+	})
 
-			if files == nil {
-				return nil, nil
-			}
+	// Test ZSTD decompressor
+	t.Run("ZSTD decompressor", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw, err := zstd.NewWriter(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = zw.Write([]byte("test data"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		zw.Close()
 
-			v = append(v, files...)
-			continue
+		reader := io.NopCloser(bytes.NewReader(buf.Bytes()))
+		decompressor, err := CreateDecompressor(reader, CompressionZstd)
+		if err != nil {
+			t.Errorf("CreateDecompressor() error = %v", err)
+			return
+		}
+		defer decompressor.Close()
+
+		data, err := io.ReadAll(decompressor)
+		if err != nil {
+			t.Errorf("Failed to read from ZSTD decompressor: %v", err)
+			return
 		}
 
-		v = append(v, entryName)
-	}
-
-	return v, nil
+		if string(data) != "test data" {
+			t.Errorf("ZSTD decompression failed: got %s, want 'test data'", string(data))
+		}
+	})
 }

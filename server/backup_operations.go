@@ -16,7 +16,7 @@ type OperationType string
 const (
 	// OperationTypeBackup represents a backup creation operation
 	OperationTypeBackup OperationType = "backup"
-	// OperationTypeRestore represents a backup restoration operation  
+	// OperationTypeRestore represents a backup restoration operation
 	OperationTypeRestore OperationType = "restore"
 )
 
@@ -61,7 +61,7 @@ func (r *BackupOperationRegistry) Register(backupID, serverID string, opType Ope
 
 	operationID := uuid.New().String()
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	operation := &BackupOperation{
 		ID:        operationID,
 		BackupID:  backupID,
@@ -73,7 +73,7 @@ func (r *BackupOperationRegistry) Register(backupID, serverID string, opType Ope
 	}
 
 	r.operations[backupID] = operation
-	
+
 	r.logger.WithFields(log.Fields{
 		"operation_id": operationID,
 		"backup_id":    backupID,
@@ -114,7 +114,7 @@ func (r *BackupOperationRegistry) Cancel(backupID string) error {
 func (r *BackupOperationRegistry) Get(backupID string) (*BackupOperation, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	
+
 	operation, exists := r.operations[backupID]
 	return operation, exists
 }
@@ -179,7 +179,7 @@ func (r *BackupOperationRegistry) CleanupStaleOperations(maxDuration time.Durati
 	defer r.mu.Unlock()
 
 	now := time.Now().Unix()
-	
+
 	for backupID, operation := range r.operations {
 		if now-operation.StartTime > int64(maxDuration.Seconds()) {
 			r.logger.WithFields(log.Fields{

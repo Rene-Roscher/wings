@@ -229,7 +229,7 @@ func postServerDeleteFiles(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	
+
 	// Log the delete activity
 	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivitySftpDelete, models.ActivityMeta{
 		"files": deletedFiles,
@@ -261,7 +261,7 @@ func postServerWriteFile(c *gin.Context) {
 	// Check if file exists to determine if this is create or update
 	_, statErr := s.Filesystem().Stat(f)
 	isNewFile := errors.Is(statErr, os.ErrNotExist)
-	
+
 	if err := s.Filesystem().Write(f, c.Request.Body, c.Request.ContentLength, 0o644); err != nil {
 		if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -383,7 +383,7 @@ func postServerPullRemoteFile(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, &st)
 }
 
@@ -420,7 +420,7 @@ func postServerCreateDirectory(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	
+
 	// Log the create directory activity
 	dirPath := path.Join(data.Path, data.Name)
 	s.SaveActivity(s.NewRequestActivity("", c.ClientIP()), server.ActivitySftpCreateDirectory, models.ActivityMeta{

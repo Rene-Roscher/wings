@@ -47,7 +47,7 @@ func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
 		ip:        sc.RemoteAddr().String(),
 		user:      uuid,
 		server:    srv.ID(),
-		publisher: srv,  // Server implements EventPublisher interface
+		publisher: srv, // Server implements EventPublisher interface
 	}
 
 	return &Handler{

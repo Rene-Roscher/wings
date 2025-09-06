@@ -57,11 +57,11 @@ func postServerBackup(c *gin.Context) {
 			cancel()
 			registry.Complete(data.Uuid)
 		}()
-		
+
 		// Add timeout if not already set
 		ctx, timeoutCancel := context.WithTimeout(ctx, 6*time.Hour)
 		defer timeoutCancel()
-		
+
 		if err := s.BackupWithContext(ctx, b); err != nil {
 			logger.WithField("error", errors.WithStackIf(err)).Error("router: failed to generate server backup")
 		}
@@ -214,7 +214,7 @@ func deleteServerBackup(c *gin.Context) {
 func cancelServerBackup(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	logger := middleware.ExtractLogger(c)
-	
+
 	backupID := c.Param("backup")
 	if backupID == "" {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
@@ -224,7 +224,7 @@ func cancelServerBackup(c *gin.Context) {
 	}
 
 	registry := server.GetBackupOperationRegistry()
-	
+
 	// Get the operation to verify it belongs to this server
 	operation, exists := registry.Get(backupID)
 	if !exists {
@@ -233,7 +233,7 @@ func cancelServerBackup(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// Verify the operation belongs to this server
 	if operation.ServerID != s.ID() {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
@@ -266,17 +266,17 @@ func cancelServerBackup(c *gin.Context) {
 func getServerBackupOperations(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	registry := server.GetBackupOperationRegistry()
-	
+
 	operations := registry.List(s.ID())
-	
+
 	// Convert operations to JSON-safe format
 	type OperationResponse struct {
-		ID        string                `json:"id"`
-		BackupID  string                `json:"backup_id"`
-		Type      server.OperationType  `json:"type"`
-		StartTime int64                 `json:"start_time"`
+		ID        string               `json:"id"`
+		BackupID  string               `json:"backup_id"`
+		Type      server.OperationType `json:"type"`
+		StartTime int64                `json:"start_time"`
 	}
-	
+
 	var response []OperationResponse
 	for _, op := range operations {
 		opResponse := OperationResponse{
@@ -285,10 +285,10 @@ func getServerBackupOperations(c *gin.Context) {
 			Type:      op.Type,
 			StartTime: op.StartTime,
 		}
-		
+
 		response = append(response, opResponse)
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"operations": response,
 		"count":      len(response),

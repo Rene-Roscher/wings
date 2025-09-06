@@ -64,7 +64,7 @@ func (s *Server) determineActualServerState() string {
 	if running, err := s.Environment.IsRunning(s.Context()); err == nil && running {
 		return environment.ProcessRunningState
 	}
-	
+
 	return environment.ProcessOfflineState
 }
 
@@ -86,7 +86,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 
 	// Set backup state to show in frontend via WebSocket
 	s.Environment.SetState(environment.ProcessBackupState)
-	
+
 	// Restore actual current state when backup is done
 	defer func() {
 		// Determine what the server state SHOULD be right now by checking actual container state
@@ -104,7 +104,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 
 	// Smart progress tracking: estimate total size once, then track progress
 	progressInstance := progress.NewProgress(0)
-	
+
 	// Simple progress tracker without goroutines
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
@@ -112,14 +112,14 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		backupType: "create",
 		progress:   progressInstance,
 	}
-	
+
 	// Connect progress callback - called on every Archive.Write()!
 	progressInstance.ProgressCallback = progressTracker.CheckProgress
 
 	// SYNCHRONOUS size estimation - must happen BEFORE backup starts to avoid race condition
 	cachedSize := s.Filesystem().CachedUsage()
 	s.Log().WithField("cached_disk_usage", cachedSize).Debug("checking cached disk usage for backup progress")
-	
+
 	// Always try to get a size estimate for percentage calculation
 	var estimatedSize int64
 	if cachedSize > 0 {
@@ -129,17 +129,17 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	} else {
 		// Fallback: try one fresh disk usage calculation (non-blocking timeout)
 		s.Log().Debug("no cached usage, attempting fresh disk usage calculation for backup progress")
-		
+
 		// Use a context with timeout to prevent hanging the backup process
 		ctx, cancel := context.WithTimeout(s.Context(), 5*time.Second)
 		defer cancel()
-		
+
 		// Channel to receive result
 		done := make(chan struct {
 			size int64
 			err  error
 		}, 1)
-		
+
 		// Run disk usage calculation in goroutine with timeout
 		go func() {
 			defer func() {
@@ -157,12 +157,12 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 				err  error
 			}{size, err}
 		}()
-		
+
 		// Wait for result or timeout
 		select {
 		case result := <-done:
 			if result.err == nil && result.size > 0 {
-				estimatedSize = result.size / 2 // tar.gz compression ~50%  
+				estimatedSize = result.size / 2 // tar.gz compression ~50%
 				s.Log().WithField("estimated_backup_size", estimatedSize).Debug("calculated fresh disk usage for backup progress")
 			} else {
 				s.Log().WithField("error", result.err).Debug("fresh disk usage calculation failed")
@@ -171,7 +171,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			s.Log().Warn("disk usage calculation timed out - using bytes-only mode for backup progress")
 		}
 	}
-	
+
 	// Set total if we got a reasonable estimate
 	if estimatedSize > 0 {
 		progressInstance.SetTotal(uint64(estimatedSize))
@@ -231,7 +231,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	// Use background context with 6-hour timeout as per CLAUDE.md production requirements
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 	defer cancel()
-	
+
 	return s.BackupWithContext(ctx, b)
 }
 
@@ -275,27 +275,41 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// NOW set restore state after server is guaranteed to be stopped
 	s.Environment.SetState(environment.ProcessRestoringState)
 
+	// Auto-detect compression format and create appropriate decompressor
+	format, detectedReader, err := filesystem.DetectCompressionFormat(reader)
+	if err != nil {
+		return errors.WrapIf(err, "failed to detect backup format")
+	}
+	reader = detectedReader
+
+	// Create decompressor based on detected format
+	decompressedReader, err := filesystem.CreateDecompressor(reader, format)
+	if err != nil {
+		return errors.WrapIf(err, "failed to create decompressor")
+	}
+	defer decompressedReader.Close()
+
 	// Restore progress tracking with real Progress instance
 	var processedFiles int64
-	
+
 	// Create progress instance for restore - estimate total from backup file size
 	restoreProgress := progress.NewProgress(0)
-	
+
 	// Try to get backup file size for percentage calculation
 	if backupSize, err := b.Details(s.Context(), nil); err == nil && backupSize.Size > 0 {
 		// Estimate uncompressed size (tar.gz expansion ~2x)
-		estimatedTotal := backupSize.Size * 2 
+		estimatedTotal := backupSize.Size * 2
 		restoreProgress.SetTotal(uint64(estimatedTotal))
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
 	}
-	
+
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
 		backupID:   b.Identifier(),
 		backupType: "restore",
 		progress:   restoreProgress, // Real progress instance!
 	}
-	
+
 	// Connect callback for percentage tracking
 	restoreProgress.ProgressCallback = progressTracker.CheckProgress
 
@@ -304,7 +318,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		if fileSize > 0 {
 			restoreProgress.AddWritten(uint64(fileSize))
 		}
-		
+
 		// Track file count (mainly for debugging/logging)
 		atomic.AddInt64(&processedFiles, 1)
 	}
@@ -312,7 +326,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
+	err = b.Restore(s.Context(), decompressedReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 
@@ -323,10 +337,10 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			return err
 		}
 		atime := info.ModTime()
-		
+
 		// Send ultra-live progress update AFTER successful write
 		updateProgress(info.Size())
-		
+
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
 
@@ -352,7 +366,7 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 	return b.Generate(ctx, s.Filesystem(), ignored)
 }
 
-// generateLocalBackupWithProgress creates a local backup with progress tracking and context support  
+// generateLocalBackupWithProgress creates a local backup with progress tracking and context support
 func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
 	a := &filesystem.Archive{
 		Filesystem: s.Filesystem(),
@@ -377,7 +391,7 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, _ *progress.Progress) (*backup.ArchiveDetails, error) {
 	// Work WITH the source: S3Backup.Generate already handles everything correctly
 	// Avoid double-creation by letting the original S3 flow work unmodified
-	// 
+	//
 	// Future improvement: Extend backup package to support progress callbacks natively
 	// For now: Accept that S3 progress tracking is limited, but backup works correctly
 	return b.Generate(ctx, s.Filesystem(), ignored)
