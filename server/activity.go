@@ -63,4 +63,10 @@ func (s *Server) SaveActivity(a RequestActivity, event models.Event, metadata mo
 				Error("activity: failed to save event")
 		}
 	}()
+
+	// Publish activity as event over WebSocket
+	s.Events().Publish(ActivityEvent, map[string]any{
+		"event":    string(event),
+		"metadata": metadata,
+	})
 }
