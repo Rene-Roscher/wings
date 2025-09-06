@@ -61,7 +61,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		// Byte mode - show every 512KB for max liveness without spam
 		percentage = -1
 		lastKB := lastSent 
-		currentKB := written / 512 // 512KB chunks = very live
+		currentKB := written / (512 * 1024) // 512KB chunks = very live
 		shouldSend = currentKB > lastKB
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, currentKB)

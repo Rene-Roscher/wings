@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"io/fs"
 	"os"
@@ -114,13 +115,39 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		estimatedSize = cachedSize / 2 // tar.gz compression ~50%
 		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("using cached disk usage for backup progress")
 	} else {
-		// Fallback: do one quick disk usage calculation 
-		s.Log().Debug("no cached usage, calculating disk usage for backup progress")
-		if diskSize, err := s.Filesystem().DiskUsage(true); err == nil && diskSize > 0 {
-			estimatedSize = diskSize / 2 // tar.gz compression ~50%  
-			s.Log().WithField("estimated_backup_size", estimatedSize).Debug("calculated disk usage for backup progress")
-		} else {
-			s.Log().WithField("error", err).Warn("failed to calculate disk usage for backup progress - using bytes-only mode")
+		// Fallback: try one fresh disk usage calculation (non-blocking timeout)
+		s.Log().Debug("no cached usage, attempting fresh disk usage calculation for backup progress")
+		
+		// Use a context with timeout to prevent hanging the backup process
+		ctx, cancel := context.WithTimeout(s.Context(), 5*time.Second)
+		defer cancel()
+		
+		// Channel to receive result
+		done := make(chan struct {
+			size int64
+			err  error
+		}, 1)
+		
+		// Run disk usage calculation in goroutine with timeout
+		go func() {
+			size, err := s.Filesystem().DiskUsage(false) // Fresh calculation
+			done <- struct {
+				size int64
+				err  error
+			}{size, err}
+		}()
+		
+		// Wait for result or timeout
+		select {
+		case result := <-done:
+			if result.err == nil && result.size > 0 {
+				estimatedSize = result.size / 2 // tar.gz compression ~50%  
+				s.Log().WithField("estimated_backup_size", estimatedSize).Debug("calculated fresh disk usage for backup progress")
+			} else {
+				s.Log().WithField("error", result.err).Debug("fresh disk usage calculation failed")
+			}
+		case <-ctx.Done():
+			s.Log().Warn("disk usage calculation timed out - using bytes-only mode for backup progress")
 		}
 	}
 	
