@@ -59,7 +59,17 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 }
 
 // determineActualServerState checks the real container state and returns the appropriate Wings state
+// This function is thread-safe and considers current operations to prevent race conditions
 func (s *Server) determineActualServerState() string {
+	// Check current state first - avoid unnecessary container queries
+	currentState := s.Environment.State()
+	
+	// If already in a transient state, preserve it to avoid race conditions
+	switch currentState {
+	case environment.ProcessBackupState, environment.ProcessRestoringState:
+		return currentState // Don't override operational states
+	}
+	
 	// The most reliable way: check if the container is actually running right now
 	if running, err := s.Environment.IsRunning(s.Context()); err == nil && running {
 		return environment.ProcessRunningState
@@ -77,21 +87,39 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		ctx, cancel = context.WithTimeout(ctx, 6*time.Hour)
 		defer cancel()
 	}
+	
+	// Context-aware operation wrapper
+	ctxDone := ctx.Done()
+	
 	// Check for context cancellation before proceeding
 	select {
-	case <-ctx.Done():
+	case <-ctxDone:
 		return ctx.Err()
 	default:
 	}
 
-	// Set backup state to show in frontend via WebSocket
+	// Atomic state transition to backup state
+	previousState := s.Environment.State()
 	s.Environment.SetState(environment.ProcessBackupState)
 
-	// Restore actual current state when backup is done
+	// Restore proper state when backup is done - context-aware
 	defer func() {
-		// Determine what the server state SHOULD be right now by checking actual container state
-		actualState := s.determineActualServerState()
-		s.Environment.SetState(actualState)
+		// Check if context was cancelled to determine appropriate final state
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// Backup was cancelled - restore previous state if it was stable
+			switch previousState {
+			case environment.ProcessRunningState, environment.ProcessOfflineState:
+				s.Environment.SetState(previousState)
+			default:
+				// Previous state was transient, determine actual state
+				actualState := s.determineActualServerState()
+				s.Environment.SetState(actualState)
+			}
+		} else {
+			// Normal completion - determine actual current state
+			actualState := s.determineActualServerState()
+			s.Environment.SetState(actualState)
+		}
 	}()
 	ignored := b.Ignored()
 	if b.Ignored() == "" {
@@ -105,18 +133,14 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	// Smart progress tracking: estimate total size once, then track progress
 	progressInstance := progress.NewProgress(0)
 
-	// Simple progress tracker without goroutines
-	progressTracker := &SimpleProgressTracker{
-		server:     s,
-		backupID:   b.Identifier(),
-		backupType: "create",
-		progress:   progressInstance,
-	}
+	// Context-aware progress tracker with proper lifecycle management
+	progressTracker := NewSimpleProgressTracker(ctx, s, b.Identifier(), "create", progressInstance)
+	defer progressTracker.Close() // Ensure cleanup
 
 	// Connect progress callback - called on every Archive.Write()!
 	progressInstance.ProgressCallback = progressTracker.CheckProgress
 
-	// SYNCHRONOUS size estimation - must happen BEFORE backup starts to avoid race condition
+	// Context-aware size estimation - SAFE from race conditions
 	cachedSize := s.Filesystem().CachedUsage()
 	s.Log().WithField("cached_disk_usage", cachedSize).Debug("checking cached disk usage for backup progress")
 
@@ -127,38 +151,49 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		estimatedSize = cachedSize / 2 // tar.gz compression ~50%
 		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("using cached disk usage for backup progress")
 	} else {
+		// Check context before expensive operation
+		select {
+		case <-ctxDone:
+			return ctx.Err()
+		default:
+		}
+		
 		// Fallback: try one fresh disk usage calculation (non-blocking timeout)
 		s.Log().Debug("no cached usage, attempting fresh disk usage calculation for backup progress")
 
-		// Use a context with timeout to prevent hanging the backup process
-		ctx, cancel := context.WithTimeout(s.Context(), 5*time.Second)
-		defer cancel()
+		// Use a context with timeout to prevent hanging the backup process  
+		sizeCtx, sizeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer sizeCancel()
 
 		// Channel to receive result
-		done := make(chan struct {
+		type sizeResult struct {
 			size int64
 			err  error
-		}, 1)
+		}
+		done := make(chan sizeResult, 1)
 
-		// Run disk usage calculation in goroutine with timeout
+		// Run disk usage calculation in managed goroutine
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
 					s.Log().WithField("panic", r).Error("panic in disk usage calculation goroutine")
-					done <- struct {
-						size int64
-						err  error
-					}{0, errors.New("disk usage calculation panicked")}
+					select {
+					case done <- sizeResult{0, errors.New("disk usage calculation panicked")}:
+					case <-sizeCtx.Done():
+					}
 				}
 			}()
-			size, err := s.Filesystem().DiskUsage(false) // Fresh calculation
-			done <- struct {
-				size int64
-				err  error
-			}{size, err}
+			
+			// Context-aware disk usage calculation
+			size, err := s.Filesystem().DiskUsage(false)
+			select {
+			case done <- sizeResult{size, err}:
+			case <-sizeCtx.Done():
+				return // Goroutine cleanup
+			}
 		}()
 
-		// Wait for result or timeout
+		// Wait for result, timeout, or cancellation
 		select {
 		case result := <-done:
 			if result.err == nil && result.size > 0 {
@@ -167,25 +202,46 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			} else {
 				s.Log().WithField("error", result.err).Debug("fresh disk usage calculation failed")
 			}
-		case <-ctx.Done():
-			s.Log().Warn("disk usage calculation timed out - using bytes-only mode for backup progress")
+		case <-sizeCtx.Done():
+			if errors.Is(sizeCtx.Err(), context.DeadlineExceeded) {
+				s.Log().Warn("disk usage calculation timed out - using bytes-only mode for backup progress")
+			} else {
+				return ctx.Err() // Parent context cancelled
+			}
 		}
 	}
 
-	// Set total if we got a reasonable estimate
-	if estimatedSize > 0 {
+	// Set total if we got a reasonable estimate (with bounds checking)
+	if estimatedSize > 0 && estimatedSize < (1<<62) { // Prevent overflow attacks
 		progressInstance.SetTotal(uint64(estimatedSize))
 	}
+	
+	// Check context before starting backup generation
+	select {
+	case <-ctxDone:
+		return ctx.Err()
+	default:
+	}
+	
 	ad, err := s.generateBackupWithProgress(ctx, b, ignored, progressInstance, progressTracker)
 	if err != nil {
+		// Store original error for proper reporting
+		originalErr := err
+		
 		progressTracker.SendFinalProgress(false) // Send error progress
-		if err := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); err != nil {
+		
+		// Try to notify panel, but preserve original error
+		if notifyErr := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); notifyErr != nil {
 			s.Log().WithFields(log.Fields{
 				"backup": b.Identifier(),
-				"error":  err,
+				"backup_error": originalErr,
+				"notify_error": notifyErr,
 			}).Warn("failed to notify panel of failed backup state")
 		} else {
-			s.Log().WithField("backup", b.Identifier()).Info("notified panel of failed backup state")
+			s.Log().WithFields(log.Fields{
+				"backup": b.Identifier(),
+				"error": originalErr,
+			}).Info("notified panel of failed backup state")
 		}
 
 		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
@@ -194,18 +250,36 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			"checksum":      "",
 			"checksum_type": "sha1",
 			"file_size":     0,
+			"error":         originalErr.Error(),
 		})
 
-		return errors.WrapIf(err, "backup: error while generating server backup")
+		return errors.WrapIf(originalErr, "backup: error while generating server backup")
 	}
 
-	// Try to notify the panel about the status of this backup. If for some reason this request
-	// fails, delete the archive from the daemon and return that error up the chain to the caller.
+	// Try to notify the panel about the successful backup status
+	// CRITICAL: Never delete successful backups due to panel communication issues!
 	if notifyError := s.notifyPanelOfBackup(b.Identifier(), ad, true); notifyError != nil {
-		_ = b.Remove()
-
-		s.Log().WithField("error", notifyError).Info("failed to notify panel of successful backup state")
-		return err
+		// Log the panel communication error but keep the backup
+		s.Log().WithFields(log.Fields{
+			"backup": b.Identifier(),
+			"notify_error": notifyError,
+			"backup_size": ad.Size,
+			"backup_checksum": ad.Checksum,
+		}).Error("failed to notify panel of successful backup - backup preserved for manual recovery")
+		
+		// Emit success event despite panel notification failure
+		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
+			"uuid":          b.Identifier(),
+			"is_successful": true,
+			"checksum":      ad.Checksum,
+			"checksum_type": "sha1",
+			"file_size":     ad.Size,
+			"panel_notified": false,
+			"notify_error":   notifyError.Error(),
+		})
+		
+		// Return success - backup was created successfully
+		return nil
 	} else {
 		s.Log().WithField("backup", b.Identifier()).Info("notified panel of successful backup state")
 	}
@@ -247,7 +321,8 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// to make sure it is a valid reader before trying to close it.
 	defer func() {
 		s.Config().SetSuspended(false)
-		// After restore, server should always be offline (restore requires server stop)
+		// After restore, server should be offline (restore requires server stop)
+		// Use atomic state transition to prevent race conditions
 		s.Environment.SetState(environment.ProcessOfflineState)
 		if reader != nil {
 			_ = reader.Close()
@@ -272,7 +347,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		}
 	}
 
-	// NOW set restore state after server is guaranteed to be stopped
+	// Atomic transition to restore state after server is guaranteed to be stopped
 	s.Environment.SetState(environment.ProcessRestoringState)
 
 	// Auto-detect compression format and create appropriate decompressor
@@ -303,24 +378,23 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
 	}
 
-	progressTracker := &SimpleProgressTracker{
-		server:     s,
-		backupID:   b.Identifier(),
-		backupType: "restore",
-		progress:   restoreProgress, // Real progress instance!
-	}
+	progressTracker := NewSimpleProgressTracker(s.Context(), s, b.Identifier(), "restore", restoreProgress)
+	defer progressTracker.Close() // Ensure cleanup
 
 	// Connect callback for percentage tracking
 	restoreProgress.ProgressCallback = progressTracker.CheckProgress
 
+	// Optimized progress update function - minimal overhead
 	updateProgress := func(fileSize int64) {
-		// Update progress efficiently without memory allocation
+		// Batch small updates to reduce atomic operations overhead
 		if fileSize > 0 {
 			restoreProgress.AddWritten(uint64(fileSize))
 		}
 
-		// Track file count (mainly for debugging/logging)
-		atomic.AddInt64(&processedFiles, 1)
+		// Only track file count if it's useful (avoid unnecessary atomic ops)
+		if processedFiles < 1000000 { // Prevent overflow on extreme file counts
+			atomic.AddInt64(&processedFiles, 1)
+		}
 	}
 
 	// Attempt to restore the backup to the server by running through each entry

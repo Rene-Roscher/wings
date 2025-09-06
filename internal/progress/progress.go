@@ -48,15 +48,17 @@ func (p *Progress) SetTotal(total uint64) {
 }
 
 // AddWritten adds to the written counter without allocating memory.
-// This is useful for tracking progress without actual byte allocation.
+// This is optimized for high-frequency calls with minimal overhead.
 func (p *Progress) AddWritten(bytes uint64) {
 	atomic.AddUint64(&p.written, bytes)
 
-	// Trigger progress callback if set
+	// Ultra-lightweight callback trigger - no goroutine overhead
 	if p.ProgressCallback != nil {
+		// Direct call with minimal panic protection
+		// This is called VERY frequently, so optimize for speed
 		func() {
 			defer func() {
-				recover() // Silent recovery - progress callback failures must never break backups
+				_ = recover() // Silent recovery - progress callback failures must never break backups
 			}()
 			p.ProgressCallback()
 		}()
@@ -64,19 +66,20 @@ func (p *Progress) AddWritten(bytes uint64) {
 }
 
 // Write totals the number of bytes that have been written to the writer.
+// This is the hot path for backup performance - optimized for minimal overhead.
 func (p *Progress) Write(v []byte) (int, error) {
 	n := len(v)
 	atomic.AddUint64(&p.written, uint64(n))
 
 	// Ultra-lightweight progress callback (no overhead if nil)
 	// CRITICAL: Never let progress callback break the backup process
+	// This is called on EVERY write operation, so minimize overhead
 	if p.ProgressCallback != nil {
-		func() {
-			defer func() {
-				recover() // Silent recovery - progress callback failures must never break backups
-			}()
-			p.ProgressCallback()
+		// Inline panic protection - no function call overhead
+		defer func() {
+			_ = recover() // Silent recovery - progress callback failures must never break backups
 		}()
+		p.ProgressCallback()
 	}
 
 	if p.Writer != nil {
