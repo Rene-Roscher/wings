@@ -24,50 +24,70 @@ type BackupProgressUpdate struct {
 	BytesTotal   int64  `json:"bytes_total,omitempty"`
 }
 
-// CheckProgress - called periodically by Archive.Write() - NO GOROUTINES!
+// CheckProgress - called on every Archive.Write() - ULTRA FAST!
 func (spt *SimpleProgressTracker) CheckProgress() {
 	if spt.progress == nil {
 		return
 	}
 
+	// Ultra-fast check: only proceed if enough time passed (no expensive operations)
+	now := time.Now().UnixNano()
+	lastTime := atomic.LoadInt64(&spt.lastTime)
+	
+	// Smart throttling: 200ms for super-live feel, but not spam
+	if (now - lastTime) < 200*1000000 { // 200ms = super live
+		return
+	}
+	
+	// Only load values if we might send an update (performance!)
 	written := int64(spt.progress.Written())
 	total := int64(spt.progress.Total())
 	
-	if total == 0 {
-		return // No total set yet
+	var percentage int
+	var shouldSend bool
+	lastSent := atomic.LoadInt64(&spt.lastSent)
+	
+	if total > 0 {
+		// Percentage mode - very responsive
+		percentage = int((written * 100) / total)
+		if percentage > 100 {
+			percentage = 100
+		}
+		// Send on ANY percentage increase (1%, 2%, 3%... super live!)
+		shouldSend = percentage > int(lastSent)
+		if shouldSend {
+			atomic.StoreInt64(&spt.lastSent, int64(percentage))
+		}
+	} else {
+		// Byte mode - show every 512KB for max liveness without spam
+		percentage = -1
+		lastKB := lastSent 
+		currentKB := written / 512 // 512KB chunks = very live
+		shouldSend = currentKB > lastKB
+		if shouldSend {
+			atomic.StoreInt64(&spt.lastSent, currentKB)
+		}
 	}
 	
-	percentage := int((written * 100) / total)
-	if percentage > 100 {
-		percentage = 100
-	}
-	
-	now := time.Now().UnixNano()
-	lastPercentage := int(atomic.LoadInt64(&spt.lastSent))
-	lastTime := atomic.LoadInt64(&spt.lastTime)
-	
-	// Only send if percentage increased AND at least 500ms passed
-	if percentage > lastPercentage && (now-lastTime) > 500*1000000 { // 500ms in nanoseconds
-		atomic.StoreInt64(&spt.lastSent, int64(percentage))
+	if shouldSend {
 		atomic.StoreInt64(&spt.lastTime, now)
 		
-		// Send progress update (async to avoid blocking)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Silent recovery - don't block backup process
-				}
-			}()
+		// Ultra-fast async send (no defer overhead)
+		go func(p int, w, t int64) {
+			// Minimal recovery overhead
+			if r := recover(); r != nil {
+				return
+			}
 			
 			update := BackupProgressUpdate{
 				Type:         spt.backupType,
-				Percentage:   percentage,
-				BytesWritten: written,
-				BytesTotal:   total,
+				Percentage:   p,
+				BytesWritten: w,
+				BytesTotal:   t,
 			}
 			
 			spt.server.Events().Publish(BackupProgressEvent, update)
-		}()
+		}(percentage, written, total)
 	}
 }
 

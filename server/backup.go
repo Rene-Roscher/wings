@@ -170,6 +170,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 
 	// Ultra-simple restore progress tracking
 	var processedFiles int64
+	var lastProgressTime int64
 	
 	progressTracker := &SimpleProgressTracker{
 		server:     s,
@@ -177,23 +178,34 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		progress:   nil, // No progress instance for restore (file-based)
 	}
 
-	updateProgress := func() {
-		current := atomic.AddInt64(&processedFiles, 1)
-		// Show progress every 10 files to avoid spam
-		if current%10 == 0 {
-			// Send simple file count update
-			update := BackupProgressUpdate{
-				Type:         "restore",
-				Percentage:   0, // No percentage for restore
-				BytesWritten: current,
-				BytesTotal:   0,
-			}
+	updateProgress := func(file string, afterWrite bool) {
+		if afterWrite {
+			// After successful file write - increment and send immediate update
+			current := atomic.AddInt64(&processedFiles, 1)
 			
-			// Async send to avoid blocking
-			go func() {
-				defer func() { recover() }() // Silent recovery
-				s.Events().Publish(BackupProgressEvent, update)
-			}()
+			// Smart throttling: send every file, but max every 100ms for super-live feel
+			now := time.Now().UnixNano()
+			lastTime := atomic.LoadInt64(&lastProgressTime)
+			
+			if (now - lastTime) > 100*1000000 { // 100ms = ultra responsive
+				atomic.StoreInt64(&lastProgressTime, now)
+				
+				// Ultra-fast async send with minimal overhead
+				go func(count int64) {
+					if r := recover(); r != nil {
+						return // Minimal recovery
+					}
+					
+					update := BackupProgressUpdate{
+						Type:         "restore", 
+						Percentage:   -1, // File-by-file mode
+						BytesWritten: count,
+						BytesTotal:   0,
+					}
+					
+					s.Events().Publish(BackupProgressEvent, update)
+				}(current)
+			}
 		}
 	}
 
@@ -204,9 +216,6 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 
-		// Update progress for each file processed
-		defer updateProgress()
-
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
@@ -214,6 +223,10 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			return err
 		}
 		atime := info.ModTime()
+		
+		// Send ultra-live progress update AFTER successful write
+		updateProgress(file, true)
+		
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
 
