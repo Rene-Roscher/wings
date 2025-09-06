@@ -184,9 +184,6 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 // In addition to the websocket event an API call is triggered to notify the
 // Panel of the new state.
 func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (err error) {
-	// Set restoring state to show in frontend via WebSocket
-	s.Environment.SetState(environment.ProcessRestoringState)
-	
 	s.Config().SetSuspended(true)
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
@@ -216,6 +213,9 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			}
 		}
 	}
+
+	// NOW set restore state after server is guaranteed to be stopped
+	s.Environment.SetState(environment.ProcessRestoringState)
 
 	// Restore progress tracking with real Progress instance
 	var processedFiles int64
