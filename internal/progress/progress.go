@@ -47,6 +47,22 @@ func (p *Progress) SetTotal(total uint64) {
 	atomic.StoreUint64(&p.total, total)
 }
 
+// AddWritten adds to the written counter without allocating memory.
+// This is useful for tracking progress without actual byte allocation.
+func (p *Progress) AddWritten(bytes uint64) {
+	atomic.AddUint64(&p.written, bytes)
+	
+	// Trigger progress callback if set
+	if p.ProgressCallback != nil {
+		func() {
+			defer func() {
+				recover() // Silent recovery - progress callback failures must never break backups
+			}()
+			p.ProgressCallback()
+		}()
+	}
+}
+
 // Write totals the number of bytes that have been written to the writer.
 func (p *Progress) Write(v []byte) (int, error) {
 	n := len(v)

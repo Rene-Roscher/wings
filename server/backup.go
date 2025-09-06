@@ -242,14 +242,12 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	restoreProgress.ProgressCallback = progressTracker.CheckProgress
 
 	updateProgress := func(fileSize int64) {
-		// Simulate progress by adding file size to progress tracker
-		// This will trigger the percentage calculation via CheckProgress callback
+		// Update progress efficiently without memory allocation
 		if fileSize > 0 {
-			// Write file size to progress to trigger percentage calculation
-			restoreProgress.Write(make([]byte, fileSize))
+			restoreProgress.AddWritten(uint64(fileSize))
 		}
 		
-		// Also track file count
+		// Track file count (mainly for debugging/logging)
 		atomic.AddInt64(&processedFiles, 1)
 	}
 
