@@ -13,6 +13,57 @@ instances, fetch server logs, generate backups, and control all aspects of the s
 In addition, Wings ships with a built-in SFTP server allowing your system to remain free of Pterodactyl specific
 dependencies, and allowing users to authenticate with the same credentials they would normally use to access the Panel.
 
+## Enhanced Features
+
+### Real-time Backup & Restore Progress Tracking
+
+Wings now provides ultra-responsive real-time progress tracking for backup creation and restoration operations via WebSocket events:
+
+#### Backup Progress Events
+- **Live percentage tracking** with intelligent size estimation
+- **Real-time byte counters** showing data processed  
+- **200ms update intervals** for maximum responsiveness without spam
+- **Smart throttling** prevents WebSocket overload while maintaining live feel
+- **Fallback to bytes-only mode** when size estimation unavailable
+
+#### Restore Progress Events  
+- **File-by-file progress tracking** with 100ms update intervals
+- **Real-time restoration status** showing files being processed
+- **Intelligent progress calculation** based on backup file size estimation
+- **Ultra-live updates** for immediate user feedback
+
+#### Server State Management
+- **New server states**: `backup` and `restore` for clear operation visibility
+- **Smart state restoration** automatically detects actual container state after operations
+- **WebSocket state events** keep frontend synchronized with server status
+- **Robust state handling** prevents race conditions during concurrent operations
+
+#### Event Payloads
+All progress events include comprehensive information:
+```json
+{
+  "backup_id": "47363ce7-d70a-430e-8e75-6dc87c8d016d",
+  "type": "create|restore", 
+  "percentage": 45,
+  "bytes_written": 1048576,
+  "bytes_total": 2097152
+}
+```
+
+#### Performance Characteristics
+- **Zero performance impact** on backup/restore operations
+- **Ultra-lightweight tracking** with atomic operations only
+- **Async event publishing** never blocks file operations  
+- **Smart size estimation** uses cached disk usage when available
+- **Graceful degradation** maintains functionality even with estimation failures
+
+### Enhanced Activity Logging
+
+- **Complete file operation tracking** for SFTP, HTTP API, and console commands
+- **Real-time WebSocket events** for all file system changes
+- **Comprehensive activity metadata** including file paths, users, and operation types
+- **Automatic event publishing** with panic recovery for maximum reliability
+
 ## Sponsors
 
 I would like to extend my sincere thanks to the following sponsors for helping fund Pterodactyl's development.
