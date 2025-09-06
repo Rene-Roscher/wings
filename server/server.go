@@ -13,12 +13,12 @@ import (
 	"github.com/apex/log"
 	"github.com/creasty/defaults"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/events"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/server/filesystem"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/events"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/server/filesystem"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Server is the high level definition for a server instance being controlled

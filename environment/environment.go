@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/pterodactyl/wings/events"
+	"github.com/Rene-Roscher/wings/events"
 )
 
 const (

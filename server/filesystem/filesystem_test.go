@@ -12,9 +12,9 @@ import (
 
 	. "github.com/franela/goblin"
 
-	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/Rene-Roscher/wings/internal/ufs"
 
-	"github.com/pterodactyl/wings/config"
+	"github.com/Rene-Roscher/wings/config"
 )
 
 func NewFs() (*Filesystem, *rootFs) {
