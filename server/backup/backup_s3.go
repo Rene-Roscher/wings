@@ -112,7 +112,21 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+	// Auto-detect compression format and decompress
+	format, detectedReader, err := filesystem.DetectCompressionFormat(io.NopCloser(reader))
+	if err != nil {
+		return errors.WrapIf(err, "failed to detect S3 backup compression format")
+	}
+	
+	decompressedReader, err := filesystem.CreateDecompressor(detectedReader, format)
+	if err != nil {
+		return errors.WrapIf(err, "failed to create decompressor for S3 backup")
+	}
+	defer decompressedReader.Close()
+	
+	// Use the mholt/archives package to extract TAR archive
+	tarFormat := archives.Tar{}
+	if err := tarFormat.Extract(ctx, decompressedReader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err

@@ -439,6 +439,13 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		restoreReader = nil
 	}
 	
+	// Track restore statistics for validation
+	var restoreStats struct {
+		fileCount int
+		dirCount  int
+		totalSize int64
+	}
+
 	err = b.Restore(ctx, restoreReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
@@ -446,6 +453,14 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		// Skip problematic root directory entries that can cause errors
 		if file == "." || file == "" || file == "/" {
 			return nil
+		}
+
+		// Track statistics for integrity validation
+		if info.IsDir() {
+			restoreStats.dirCount++
+		} else {
+			restoreStats.fileCount++
+			restoreStats.totalSize += info.Size()
 		}
 
 		// Handle directories and files differently
@@ -474,6 +489,20 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
 
+	// Basic restore validation
+	if err == nil {
+		s.Log().WithFields(log.Fields{
+			"files_restored": restoreStats.fileCount,
+			"dirs_restored":  restoreStats.dirCount,
+			"total_size":     restoreStats.totalSize,
+		}).Info("backup restore completed successfully")
+		
+		// Sanity check: restore must have processed something
+		if restoreStats.fileCount == 0 && restoreStats.dirCount == 0 {
+			s.Log().Warn("restore completed but no files or directories were processed - backup may be empty or corrupt")
+		}
+	}
+
 	// Send final progress update
 	progressTracker.SendFinalProgress(err == nil)
 
@@ -499,7 +528,78 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 	}
 
 	// Fallback to original Generate method if backup type is unknown
-	return b.Generate(ctx, s.Filesystem(), ignored)
+	ad, err := b.Generate(ctx, s.Filesystem(), ignored)
+	if err != nil {
+		return nil, err
+	}
+
+	// Quick integrity validation for any backup type
+	if err := s.validateBackupIntegrity(b); err != nil {
+		s.Log().WithError(err).Error("backup integrity validation failed - backup may be unreliable")
+	}
+
+	return ad, nil
+}
+
+// validateBackupIntegrity performs minimal integrity checks on backup file
+func (s *Server) validateBackupIntegrity(b backup.BackupInterface) error {
+	backupPath := ""
+	
+	// Get backup path based on type
+	if localBackup, ok := b.(*backup.LocalBackup); ok {
+		backupPath = localBackup.Path()
+	} else {
+		// For S3 backups, we can't validate local file
+		return nil
+	}
+	
+	// Basic file existence and size check
+	stat, err := os.Stat(backupPath)
+	if err != nil {
+		return errors.Wrap(err, "backup file not accessible")
+	}
+	
+	// Archive must be at least 1KB (even empty server has some overhead)
+	if stat.Size() < 1024 {
+		return errors.New("backup file suspiciously small - may be corrupt")
+	}
+	
+	// Quick magic bytes check for GZIP
+	f, err := os.Open(backupPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	
+	magic := make([]byte, 2)
+	if n, err := f.Read(magic); err != nil || n < 2 {
+		return errors.New("cannot read backup file header")
+	}
+	
+	// Check for GZIP magic bytes (0x1f, 0x8b) or other valid formats
+	if magic[0] == 0x1f && magic[1] == 0x8b {
+		// Valid GZIP
+		return nil
+	}
+	
+	// Check for uncompressed TAR (less common but possible)
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	
+	// Read TAR header area
+	tarTest := make([]byte, 512)
+	if n, err := f.Read(tarTest); err != nil || n < 512 {
+		return errors.New("backup file too short for valid TAR")
+	}
+	
+	// Very basic TAR validation - check for reasonable header structure
+	// TAR headers have specific patterns at specific offsets
+	if tarTest[156] == '0' || tarTest[156] == '5' { // Regular file or directory
+		return nil
+	}
+	
+	return errors.New("backup file format not recognized - may be corrupt")
 }
 
 // generateLocalBackupWithProgress creates a local backup with progress tracking and context support
