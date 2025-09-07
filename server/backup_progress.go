@@ -43,11 +43,6 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	now := time.Now().UnixNano()
 	lastTime := atomic.LoadInt64(&spt.lastTime)
 
-	// Smart throttling: 300ms for balance between responsiveness and performance  
-	if (now - lastTime) < 300*1000000 { // 300ms = good balance
-		return
-	}
-
 	// Only load values if we might send an update (performance!)
 	written := int64(spt.progress.Written())
 	total := int64(spt.progress.Total())
@@ -56,32 +51,35 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	var shouldSend bool
 	lastSent := atomic.LoadInt64(&spt.lastSent)
 
-	// TIME-BASED THROTTLING: Only send events maximum every 250ms to prevent WebSocket flooding
-	const throttleIntervalNanos = 250_000_000 // 250ms in nanoseconds
-	shouldSendByTime := (now - atomic.LoadInt64(&spt.lastTime)) >= throttleIntervalNanos
+	// SINGLE THROTTLING CHECK: Only send events maximum every 250ms to prevent WebSocket flooding
+	const throttleIntervalNanos = 250_000_000 // 250ms in nanoseconds  
+	shouldSendByTime := (now - lastTime) >= throttleIntervalNanos
+
+	// Check if this is initial progress (0%)
+	isInitialProgress := lastTime == 0 && lastSent == 0
 
 	if total > 0 {
 		// Percentage mode - responsive but throttled
 		percentage = min(100, int((written*100)/total))
-		// Send on percentage increase AND time throttle
+		// Send on percentage increase AND time throttle (OR initial)
 		percentageChanged := percentage > int(lastSent)
-		shouldSend = percentageChanged && shouldSendByTime
+		shouldSend = (percentageChanged && shouldSendByTime) || isInitialProgress
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, int64(percentage))
 		}
 	} else {
 		// Byte mode - show progress in 1MB chunks with time throttling  
-		percentage = -1
+		percentage = 0 // Use 0% for unknown total instead of -1
 		lastMB := lastSent
-		currentMB := written / (1024 * 1024) // 1MB chunks with time throttling
-		dataChanged := currentMB > lastMB
-		shouldSend = dataChanged && shouldSendByTime
+		currentMB := written / (1024 * 1024) // 1MB chunks
+		dataChanged := currentMB > lastMB || written > 0 // Include any progress
+		shouldSend = (dataChanged && shouldSendByTime) || isInitialProgress
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, currentMB)
 		}
 	}
 
-	// ALWAYS send final progress (100%) regardless of throttling
+	// ALWAYS send initial progress (0%) and final progress (100%) regardless of throttling
 	isFinalProgress := total > 0 && percentage >= 100
 	
 	if shouldSend || isFinalProgress {
@@ -100,7 +98,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		}
 		
 		spt.wg.Add(1)
-		go func(p int, w, t int64, isFinal bool) {
+		go func(p int, w, t int64, isFinal, isInitial bool) {
 			defer spt.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
@@ -127,13 +125,20 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 
 			spt.server.Events().Publish(BackupProgressEvent, update)
 			
-			// Log final progress for debugging
+			// Enhanced debugging for critical events
 			if isFinal {
 				spt.server.Log().WithField("backup_id", spt.backupID).
 					WithField("percentage", p).
-					Debug("sent final backup progress event")
+					WithField("bytes_written", w).
+					WithField("bytes_total", t).
+					Info("sent FINAL backup progress event")
+			} else if isInitial {
+				spt.server.Log().WithField("backup_id", spt.backupID).
+					WithField("percentage", p).
+					WithField("bytes_total", t).
+					Debug("sent INITIAL backup progress event")
 			}
-		}(percentage, written, total, isFinalProgress)
+		}(percentage, written, total, isFinalProgress, isInitialProgress)
 	}
 }
 
