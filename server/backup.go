@@ -14,6 +14,7 @@ import (
 
 	"github.com/Rene-Roscher/wings/environment"
 	"github.com/Rene-Roscher/wings/internal/progress"
+	"github.com/Rene-Roscher/wings/internal/ufs"
 	"github.com/Rene-Roscher/wings/remote"
 	"github.com/Rene-Roscher/wings/server/backup"
 	"github.com/Rene-Roscher/wings/server/filesystem"
@@ -442,6 +443,23 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 
+		// Skip problematic root directory entries that can cause errors
+		if file == "." || file == "" || file == "/" {
+			return nil
+		}
+
+		// Handle directories and files differently
+		if info.IsDir() {
+			// For directories, create the directory structure using the underlying UnixFS
+			if err := s.Filesystem().UnixFS().MkdirAll(file, ufs.FileMode(info.Mode())); err != nil {
+				return err
+			}
+			// Set directory timestamps
+			atime := info.ModTime()
+			return s.Filesystem().Chtimes(file, atime, atime)
+		}
+
+		// For regular files, write the content
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
