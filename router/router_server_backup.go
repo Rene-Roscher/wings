@@ -16,6 +16,48 @@ import (
 	"github.com/Rene-Roscher/wings/server/backup"
 )
 
+// isValidBackupContentType validates if the given content type is supported for backup restoration
+// Supports GZIP, ZSTD, TAR, and generic application types that may contain backup data
+func isValidBackupContentType(contentType string) bool {
+	// Remove any charset or boundary parameters
+	ctBase := strings.Split(contentType, ";")[0]
+	ctBase = strings.TrimSpace(strings.ToLower(ctBase))
+	
+	// List of acceptable content types for backup files
+	validTypes := []string{
+		// GZIP formats
+		"application/x-gzip",
+		"application/gzip",
+		"application/x-compressed",
+		"application/x-gtar",
+		
+		// ZSTD formats  
+		"application/x-zstd",
+		"application/zstd",
+		"application/x-zstandard", 
+		
+		// TAR formats
+		"application/x-tar",
+		"application/tar",
+		
+		// Generic/fallback types (some S3 providers use these)
+		"application/octet-stream",
+		"binary/octet-stream",
+		
+		// Backup-specific types
+		"application/x-compressed-tar",
+		"application/x-tgz",
+	}
+	
+	for _, validType := range validTypes {
+		if ctBase == validType {
+			return true
+		}
+	}
+	
+	return false
+}
+
 // postServerBackup performs a backup against a given server instance using the
 // provided backup adapter.
 func postServerBackup(c *gin.Context) {
@@ -212,11 +254,14 @@ func postServerRestoreBackup(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	// Don't allow content types that we know are going to give us problems.
-	if res.Header.Get("Content-Type") == "" || !strings.Contains("application/x-gzip application/gzip", res.Header.Get("Content-Type")) {
+	// Validate content types for supported backup formats
+	contentType := res.Header.Get("Content-Type")
+	if contentType == "" {
+		// Accept empty content type (some S3 providers don't set it)
+	} else if !isValidBackupContentType(contentType) {
 		_ = res.Body.Close()
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "The provided backup link is not a supported content type. \"" + res.Header.Get("Content-Type") + "\" is not application/x-gzip.",
+			"error": "The provided backup link has an unsupported content type. \"" + contentType + "\" is not a supported backup format (gzip, zstd, or tar).",
 		})
 		return
 	}

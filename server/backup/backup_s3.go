@@ -242,7 +242,9 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 
 	r.ContentLength = size
 	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-	r.Header.Add("Content-Type", "application/x-gzip")
+	// Use generic content type since we support multiple compression formats
+	// The actual format will be auto-detected during restore
+	r.Header.Add("Content-Type", "application/octet-stream")
 
 	// Limit the reader to the size of the part - prevents over-read attacks
 	r.Body = Reader{Reader: io.LimitReader(fu.ReadCloser, size)}
