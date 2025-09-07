@@ -1,10 +1,15 @@
 package server
 
 import (
+	"archive/tar"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -64,13 +69,13 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 func (s *Server) determineActualServerState() string {
 	// Check current state first - avoid unnecessary container queries
 	currentState := s.Environment.State()
-	
+
 	// If already in a transient state, preserve it to avoid race conditions
 	switch currentState {
 	case environment.ProcessBackupState, environment.ProcessRestoringState:
 		return currentState // Don't override operational states
 	}
-	
+
 	// The most reliable way: check if the container is actually running right now
 	if running, err := s.Environment.IsRunning(s.Context()); err == nil && running {
 		return environment.ProcessRunningState
@@ -92,7 +97,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	} else {
 		s.Log().Debug("backup context: using provided context with existing deadline")
 	}
-	
+
 	// CRITICAL: Ensure this backup is properly registered in operation registry
 	registry := GetBackupOperationRegistry()
 	if _, exists := registry.Get(b.Identifier()); !exists {
@@ -101,7 +106,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	} else {
 		s.Log().WithField("backup_id", b.Identifier()).Debug("backup operation confirmed in registry")
 	}
-	
+
 	// Note: Registry completion is handled by the caller (router layer)
 
 	// Atomic state transition to backup state
@@ -112,7 +117,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	// Restore proper state when backup is done - context-aware
 	defer func() {
 		// Note: SetBackingUp(false) is now handled in router layer
-		
+
 		// Check if context was cancelled to determine appropriate final state
 		if errors.Is(ctx.Err(), context.Canceled) {
 			// Backup was cancelled - restore previous state if it was stable
@@ -166,11 +171,11 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			return ctx.Err()
 		default:
 		}
-		
+
 		// Fallback: try one fresh disk usage calculation (non-blocking timeout)
 		s.Log().Debug("no cached usage, attempting fresh disk usage calculation for backup progress")
 
-		// Use a context with timeout to prevent hanging the backup process  
+		// Use a context with timeout to prevent hanging the backup process
 		sizeCtx, sizeCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer sizeCancel()
 
@@ -192,7 +197,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 					}
 				}
 			}()
-			
+
 			// Context-aware disk usage calculation
 			size, err := s.Filesystem().DiskUsage(false)
 			select {
@@ -224,32 +229,32 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	if estimatedSize > 0 && estimatedSize < (1<<62) { // Prevent overflow attacks
 		progressInstance.SetTotal(uint64(estimatedSize))
 	}
-	
+
 	// Check context before starting backup generation
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	
+
 	ad, err := s.generateBackupWithProgress(ctx, b, ignored, progressInstance, progressTracker)
 	if err != nil {
 		// Store original error for proper reporting
 		originalErr := err
-		
+
 		progressTracker.SendFinalProgress(false) // Send error progress
-		
+
 		// Try to notify panel, but preserve original error
 		if notifyErr := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); notifyErr != nil {
 			s.Log().WithFields(log.Fields{
-				"backup": b.Identifier(),
+				"backup":       b.Identifier(),
 				"backup_error": originalErr,
 				"notify_error": notifyErr,
 			}).Warn("failed to notify panel of failed backup state")
 		} else {
 			s.Log().WithFields(log.Fields{
 				"backup": b.Identifier(),
-				"error": originalErr,
+				"error":  originalErr,
 			}).Info("notified panel of failed backup state")
 		}
 
@@ -270,23 +275,23 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	if notifyError := s.notifyPanelOfBackup(b.Identifier(), ad, true); notifyError != nil {
 		// Log the panel communication error but keep the backup
 		s.Log().WithFields(log.Fields{
-			"backup": b.Identifier(),
-			"notify_error": notifyError,
-			"backup_size": ad.Size,
+			"backup":          b.Identifier(),
+			"notify_error":    notifyError,
+			"backup_size":     ad.Size,
 			"backup_checksum": ad.Checksum,
 		}).Error("failed to notify panel of successful backup - backup preserved for manual recovery")
-		
+
 		// Emit success event despite panel notification failure
 		s.Events().Publish(BackupCompletedEvent, map[string]any{
-			"uuid":          b.Identifier(),
-			"is_successful": true,
-			"checksum":      ad.Checksum,
-			"checksum_type": "sha1",
-			"file_size":     ad.Size,
+			"uuid":           b.Identifier(),
+			"is_successful":  true,
+			"checksum":       ad.Checksum,
+			"checksum_type":  "sha1",
+			"file_size":      ad.Size,
 			"panel_notified": false,
 			"notify_error":   notifyError.Error(),
 		})
-		
+
 		// Return success - backup was created successfully
 		return nil
 	} else {
@@ -370,7 +375,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 
 	// Handle different restore scenarios
 	var decompressedReader io.ReadCloser
-	
+
 	if reader == nil {
 		// LOCAL BACKUP RESTORE: reader is nil, backup interface handles decompression
 		s.Log().Debug("performing local backup restore - backup interface handles decompression")
@@ -378,7 +383,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	} else {
 		// REMOTE BACKUP RESTORE: we need to detect format and decompress
 		s.Log().Debug("performing remote backup restore - detecting compression format")
-		
+
 		// Auto-detect compression format and create appropriate decompressor
 		format, detectedReader, err := filesystem.DetectCompressionFormat(reader)
 		if err != nil {
@@ -430,7 +435,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	
+
 	// For local backups, pass the original reader (backup interface handles decompression)
 	// For remote backups, pass the decompressed reader
 	restoreReader := decompressedReader
@@ -438,7 +443,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		// Local backup: let backup interface handle its own file reading
 		restoreReader = nil
 	}
-	
+
 	// Track restore statistics for validation
 	var restoreStats struct {
 		fileCount int
@@ -448,10 +453,10 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 
 	err = b.Restore(ctx, restoreReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
-		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		//s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 
 		// Skip problematic root directory entries that can cause errors
-		if file == "." || file == "" || file == "/" {
+		if file == "." || file == "" || file == "/" || file == "./" || strings.HasPrefix(file, "../") {
 			return nil
 		}
 
@@ -496,7 +501,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 			"dirs_restored":  restoreStats.dirCount,
 			"total_size":     restoreStats.totalSize,
 		}).Info("backup restore completed successfully")
-		
+
 		// Sanity check: restore must have processed something
 		if restoreStats.fileCount == 0 && restoreStats.dirCount == 0 {
 			s.Log().Warn("restore completed but no files or directories were processed - backup may be empty or corrupt")
@@ -538,13 +543,20 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 		s.Log().WithError(err).Error("backup integrity validation failed - backup may be unreliable")
 	}
 
+	// Content integrity validation (file/directory count check)
+	if localBackup, ok := b.(*backup.LocalBackup); ok {
+		if err := s.validateBackupContent(localBackup.Path(), s.Filesystem().Path()); err != nil {
+			s.Log().WithError(err).Error("backup content validation failed - backup may be incomplete")
+		}
+	}
+
 	return ad, nil
 }
 
 // validateBackupIntegrity performs minimal integrity checks on backup file
 func (s *Server) validateBackupIntegrity(b backup.BackupInterface) error {
 	backupPath := ""
-	
+
 	// Get backup path based on type
 	if localBackup, ok := b.(*backup.LocalBackup); ok {
 		backupPath = localBackup.Path()
@@ -552,54 +564,214 @@ func (s *Server) validateBackupIntegrity(b backup.BackupInterface) error {
 		// For S3 backups, we can't validate local file
 		return nil
 	}
-	
+
 	// Basic file existence and size check
 	stat, err := os.Stat(backupPath)
 	if err != nil {
 		return errors.Wrap(err, "backup file not accessible")
 	}
-	
-	// Archive must be at least 1KB (even empty server has some overhead)
-	if stat.Size() < 1024 {
+
+	// Archive must be at least 20 bytes (minimum GZIP + TAR headers)
+	if stat.Size() < 20 {
 		return errors.New("backup file suspiciously small - may be corrupt")
 	}
-	
+
 	// Quick magic bytes check for GZIP
 	f, err := os.Open(backupPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	
+
 	magic := make([]byte, 2)
 	if n, err := f.Read(magic); err != nil || n < 2 {
 		return errors.New("cannot read backup file header")
 	}
-	
-	// Check for GZIP magic bytes (0x1f, 0x8b) or other valid formats
+
+	// Check for GZIP magic bytes (0x1f, 0x8b) or ZSTD magic bytes (0x28, 0xb5)
 	if magic[0] == 0x1f && magic[1] == 0x8b {
 		// Valid GZIP
 		return nil
 	}
-	
+	if magic[0] == 0x28 && magic[1] == 0xb5 {
+		// Valid ZSTD
+		return nil
+	}
+
 	// Check for uncompressed TAR (less common but possible)
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
 	}
-	
+
 	// Read TAR header area
 	tarTest := make([]byte, 512)
 	if n, err := f.Read(tarTest); err != nil || n < 512 {
 		return errors.New("backup file too short for valid TAR")
 	}
-	
+
 	// Very basic TAR validation - check for reasonable header structure
 	// TAR headers have specific patterns at specific offsets
 	if tarTest[156] == '0' || tarTest[156] == '5' { // Regular file or directory
 		return nil
 	}
-	
+
 	return errors.New("backup file format not recognized - may be corrupt")
+}
+
+// validateBackupContent performs fast file/directory count validation between original and backup
+func (s *Server) validateBackupContent(backupPath, serverPath string) error {
+	// 1. Count original files and directories (fast directory walk)
+	originalStats, err := s.countServerFilesAndDirs(serverPath)
+	if err != nil {
+		return errors.Wrap(err, "failed to count original server files")
+	}
+
+	// 2. Count backup entries (TAR header scan only, no extraction)
+	backupStats, err := s.countBackupEntries(backupPath)
+	if err != nil {
+		return errors.Wrap(err, "failed to count backup entries")
+	}
+
+	// Generate SHA1 checksums for debug logging
+	backupChecksum := "unknown"
+	serverChecksum := "unknown"
+
+	// Get backup file SHA1 (reuse existing checksum method)
+	if backupFile, err := os.Open(backupPath); err == nil {
+		hasher := sha1.New()
+		if _, err := io.Copy(hasher, backupFile); err == nil {
+			backupChecksum = hex.EncodeToString(hasher.Sum(nil))
+		}
+		backupFile.Close()
+	}
+
+	// Get server directory content SHA1 (walk files and hash content)
+	if serverHash := sha1.New(); serverHash != nil {
+		err := filepath.Walk(serverPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil || path == serverPath || info.IsDir() {
+				return nil // Skip errors, root, and directories
+			}
+
+			relPath, _ := filepath.Rel(serverPath, path)
+			serverHash.Write([]byte(relPath)) // Include path in hash
+
+			if file, err := os.Open(path); err == nil {
+				io.Copy(serverHash, file)
+				file.Close()
+			}
+			return nil
+		})
+
+		if err == nil {
+			serverChecksum = hex.EncodeToString(serverHash.Sum(nil))
+		}
+	}
+
+	s.Log().WithFields(log.Fields{
+		"original_files":      originalStats.FileCount,
+		"original_dirs":       originalStats.DirCount,
+		"backup_files":        backupStats.FileCount,
+		"backup_dirs":         backupStats.DirCount,
+		"backup_sha1":         backupChecksum,
+		"server_content_sha1": serverChecksum,
+	}).Debug("backup content validation stats")
+
+	// 3. Compare file counts
+	if originalStats.FileCount != backupStats.FileCount {
+		return errors.Errorf("backup file count mismatch: expected %d files, backup contains %d files",
+			originalStats.FileCount, backupStats.FileCount)
+	}
+
+	// 4. Compare directory counts
+	if originalStats.DirCount != backupStats.DirCount {
+		return errors.Errorf("backup directory count mismatch: expected %d directories, backup contains %d directories",
+			originalStats.DirCount, backupStats.DirCount)
+	}
+
+	return nil
+}
+
+// fileStats holds counts for validation
+type fileStats struct {
+	FileCount int
+	DirCount  int
+}
+
+// countServerFilesAndDirs counts files and directories in server filesystem
+func (s *Server) countServerFilesAndDirs(serverPath string) (*fileStats, error) {
+	stats := &fileStats{}
+
+	err := filepath.Walk(serverPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Skip unreadable files/dirs but continue counting
+			return nil
+		}
+
+		// Skip the root directory itself
+		if path == serverPath {
+			return nil
+		}
+
+		if info.IsDir() {
+			stats.DirCount++
+		} else {
+			stats.FileCount++
+		}
+
+		return nil
+	})
+
+	return stats, err
+}
+
+// countBackupEntries counts entries in TAR archive by scanning headers only (no extraction)
+func (s *Server) countBackupEntries(backupPath string) (*fileStats, error) {
+	stats := &fileStats{}
+
+	f, err := os.Open(backupPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Auto-detect compression and create appropriate reader
+	format, detectedReader, err := filesystem.DetectCompressionFormat(io.NopCloser(f))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to detect backup compression format")
+	}
+
+	decompressedReader, err := filesystem.CreateDecompressor(detectedReader, format)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create decompressor")
+	}
+	defer decompressedReader.Close()
+
+	// Scan TAR headers (no content reading)
+	tarReader := tar.NewReader(decompressedReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read TAR header")
+		}
+
+		// Skip problematic root entries (same logic as restore)
+		if header.Name == "." || header.Name == "" || header.Name == "/" ||
+			header.Name == "./" || strings.HasPrefix(header.Name, "../") {
+			continue
+		}
+
+		// Count based on header type
+		if header.FileInfo().IsDir() {
+			stats.DirCount++
+		} else {
+			stats.FileCount++
+		}
+	}
+
+	return stats, nil
 }
 
 // generateLocalBackupWithProgress creates a local backup with progress tracking and context support

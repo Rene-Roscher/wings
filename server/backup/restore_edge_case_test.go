@@ -187,7 +187,7 @@ func TestRestoreSkipsInvalidPaths(t *testing.T) {
 			var wasSkipped bool
 			
 			// This simulates the fix we applied to the restore logic
-			if test.path == "." || test.path == "" || test.path == "/" || strings.HasPrefix(test.path, "../") {
+			if test.path == "." || test.path == "" || test.path == "/" || test.path == "./" || strings.HasPrefix(test.path, "../") {
 				wasSkipped = true
 				t.Logf("Correctly skipped problematic path: '%s'", test.path)
 			} else {
