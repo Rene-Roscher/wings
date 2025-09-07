@@ -72,6 +72,16 @@ func (r *BackupOperationRegistry) Register(backupID, serverID string, opType Ope
 		StartTime: time.Now().Unix(),
 	}
 
+	// Check if operation already exists (shouldn't happen with proper state management)
+	if existing, exists := r.operations[backupID]; exists {
+		r.logger.WithFields(log.Fields{
+			"backup_id":    backupID,
+			"existing_id":  existing.ID,
+			"new_id":       operationID,
+			"type":         opType,
+		}).Warn("backup operation already exists, replacing")
+	}
+
 	r.operations[backupID] = operation
 
 	r.logger.WithFields(log.Fields{

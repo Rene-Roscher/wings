@@ -116,12 +116,11 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	// Atomic state transition to backup state
 	previousState := s.Environment.State()
 	s.Environment.SetState(environment.ProcessBackupState)
-	s.SetBackingUp(true)
+	// Note: SetBackingUp(true) is now handled in router layer to prevent race conditions
 
 	// Restore proper state when backup is done - context-aware
 	defer func() {
-		// Always reset backup state first
-		s.SetBackingUp(false)
+		// Note: SetBackingUp(false) is now handled in router layer
 		
 		// Check if context was cancelled to determine appropriate final state
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -263,7 +262,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			}).Info("notified panel of failed backup state")
 		}
 
-		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
+		s.Events().Publish(BackupCompletedEvent, map[string]any{
 			"uuid":          b.Identifier(),
 			"is_successful": false,
 			"checksum":      "",
@@ -287,7 +286,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		}).Error("failed to notify panel of successful backup - backup preserved for manual recovery")
 		
 		// Emit success event despite panel notification failure
-		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
+		s.Events().Publish(BackupCompletedEvent, map[string]any{
 			"uuid":          b.Identifier(),
 			"is_successful": true,
 			"checksum":      ad.Checksum,
@@ -307,7 +306,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 
 	// Emit an event over the socket so we can update the backup in realtime on
 	// the frontend for the server.
-	s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]any{
+	s.Events().Publish(BackupCompletedEvent, map[string]any{
 		"uuid":          b.Identifier(),
 		"is_successful": true,
 		"checksum":      ad.Checksum,

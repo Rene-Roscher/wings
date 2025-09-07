@@ -63,13 +63,24 @@ func postServerBackup(c *gin.Context) {
 		"request_id": c.GetString("request_id"),
 	})
 
+	// Set backup state BEFORE starting goroutine to prevent race conditions
+	s.SetBackingUp(true)
+
 	go func(b backup.BackupInterface, s *server.Server, logger *log.Entry) {
+		// Ensure backup state is always reset, even on panic
+		defer func() {
+			if r := recover(); r != nil {
+				logger.WithField("panic", r).Error("backup operation panicked")
+			}
+			s.SetBackingUp(false)
+		}()
 		// Register operation for cancellation support
 		registry := server.GetBackupOperationRegistry()
 		_, ctx, cancel := registry.Register(data.Uuid, s.ID(), server.OperationTypeBackup)
+		// Defer cleanup - will run AFTER backup completes
 		defer func() {
-			cancel()
 			registry.Complete(data.Uuid)
+			cancel() // Cancel AFTER marking complete
 		}()
 
 		// Add timeout if not already set
@@ -157,8 +168,11 @@ func postServerRestoreBackup(c *gin.Context) {
 			registry := server.GetBackupOperationRegistry()
 			_, ctx, cancel := registry.Register(c.Param("backup"), s.ID(), server.OperationTypeRestore)
 			defer func() {
-				cancel()
+				if r := recover(); r != nil {
+					logger.WithField("panic", r).Error("restore operation panicked")
+				}
 				registry.Complete(c.Param("backup"))
+				cancel() // Cancel AFTER marking complete
 				s.SetRestoring(false) // Ensure restoring state is always reset
 			}()
 
@@ -208,12 +222,18 @@ func postServerRestoreBackup(c *gin.Context) {
 	}
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
+		// CRITICAL: Always close response body to prevent resource leak
+		defer res.Body.Close()
+		
 		// Register restore operation for cancellation support
 		registry := server.GetBackupOperationRegistry()
 		_, ctx, cancel := registry.Register(uuid, s.ID(), server.OperationTypeRestore)
 		defer func() {
-			cancel()
+			if r := recover(); r != nil {
+				logger.WithField("panic", r).Error("S3 restore operation panicked")
+			}
 			registry.Complete(uuid)
+			cancel() // Cancel AFTER marking complete
 			s.SetRestoring(false) // Ensure restoring state is always reset
 		}()
 
