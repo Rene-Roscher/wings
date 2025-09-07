@@ -92,9 +92,6 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		s.Log().Debug("backup context: using provided context with existing deadline")
 	}
 	
-	// Context-aware operation wrapper
-	ctxDone := ctx.Done()
-	
 	// CRITICAL: Ensure this backup is properly registered in operation registry
 	registry := GetBackupOperationRegistry()
 	if _, exists := registry.Get(b.Identifier()); !exists {
@@ -105,13 +102,6 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	}
 	
 	// Note: Registry completion is handled by the caller (router layer)
-	
-	// Check for context cancellation before proceeding
-	select {
-	case <-ctxDone:
-		return ctx.Err()
-	default:
-	}
 
 	// Atomic state transition to backup state
 	previousState := s.Environment.State()
@@ -171,7 +161,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	} else {
 		// Check context before expensive operation
 		select {
-		case <-ctxDone:
+		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
@@ -236,7 +226,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	
 	// Check context before starting backup generation
 	select {
-	case <-ctxDone:
+	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}

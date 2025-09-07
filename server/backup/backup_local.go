@@ -129,7 +129,25 @@ func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback Restore
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+	
+	// Wrap reader in NopCloser to satisfy ReadCloser interface
+	readCloser := io.NopCloser(reader)
+	
+	// Auto-detect compression format and decompress
+	format, detectedReader, err := filesystem.DetectCompressionFormat(readCloser)
+	if err != nil {
+		return errors.WrapIf(err, "failed to detect backup compression format")
+	}
+	
+	decompressedReader, err := filesystem.CreateDecompressor(detectedReader, format)
+	if err != nil {
+		return errors.WrapIf(err, "failed to create decompressor for backup")
+	}
+	defer decompressedReader.Close()
+	
+	// Use the mholt/archives package to extract TAR archive
+	tarFormat := archives.Tar{}
+	if err := tarFormat.Extract(ctx, decompressedReader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err

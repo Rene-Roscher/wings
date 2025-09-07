@@ -205,10 +205,8 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 		base = filepath.Base(a.BaseDirectory) + "/"
 	}
 	return func(dirfd int, name, relative string, d ufs.DirEntry) error {
-		// Skip directories because we are walking them recursively.
-		if d.IsDir() {
-			return nil
-		}
+		// CRITICAL: Include directories in archive to preserve empty directories!
+		// We need to archive directory entries to maintain the complete structure.
 
 		// If base isn't empty, strip it from the relative path. This fixes an
 		// issue when creating an archive starting from a nested directory.
@@ -229,8 +227,8 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 			}
 		}
 
-		// Add the file to the archive, if it is nested in a directory,
-		// the directory will be automatically "created" in the archive.
+		// Add the file or directory to the archive. This is CRITICAL for preserving
+		// empty directories - we must include directory entries in the TAR archive.
 		return a.addToArchive(dirfd, name, relative, d)
 	}
 }
@@ -309,7 +307,8 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", name)
 	}
 
-	// If the size of the file is less than 1 (most likely for symlinks), skip writing the file.
+	// If the size of the file is less than 1 (directories and symlinks), skip writing file content.
+	// For directories, we've already written the header which preserves the directory structure.
 	if header.Size < 1 {
 		return nil
 	}
