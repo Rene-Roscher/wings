@@ -81,8 +81,14 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		}
 	}
 
-	if shouldSend {
+	// ALWAYS send final progress (100%) regardless of throttling
+	isFinalProgress := total > 0 && percentage >= 100
+	
+	if shouldSend || isFinalProgress {
 		atomic.StoreInt64(&spt.lastTime, now)
+		if percentage >= 0 {
+			atomic.StoreInt64(&spt.lastSent, int64(percentage))
+		}
 
 		// Context-aware async send with proper lifecycle management
 		if spt.ctx != nil {
@@ -94,7 +100,7 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		}
 		
 		spt.wg.Add(1)
-		go func(p int, w, t int64) {
+		go func(p int, w, t int64, isFinal bool) {
 			defer spt.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
@@ -120,7 +126,14 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 			}
 
 			spt.server.Events().Publish(BackupProgressEvent, update)
-		}(percentage, written, total)
+			
+			// Log final progress for debugging
+			if isFinal {
+				spt.server.Log().WithField("backup_id", spt.backupID).
+					WithField("percentage", p).
+					Debug("sent final backup progress event")
+			}
+		}(percentage, written, total, isFinalProgress)
 	}
 }
 
