@@ -543,11 +543,10 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 		s.Log().WithError(err).Error("backup integrity validation failed - backup may be unreliable")
 	}
 
-	// Content integrity validation (file/directory count check)
-	if localBackup, ok := b.(*backup.LocalBackup); ok {
-		if err := s.validateBackupContent(localBackup.Path(), s.Filesystem().Path()); err != nil {
-			s.Log().WithError(err).Error("backup content validation failed - backup may be incomplete")
-		}
+	// Content integrity validation (file/directory count check) - FOR ALL BACKUP TYPES
+	backupPath := b.Path() // Works for all backup types
+	if err := s.validateBackupContent(backupPath, s.Filesystem().Path()); err != nil {
+		s.Log().WithError(err).Error("backup content validation failed - backup may be incomplete")
 	}
 
 	return ad, nil
