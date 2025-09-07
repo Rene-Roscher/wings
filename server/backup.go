@@ -547,6 +547,8 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 	backupPath := b.Path() // Works for all backup types
 	if err := s.validateBackupContent(backupPath, s.Filesystem().Path()); err != nil {
 		s.Log().WithError(err).Error("backup content validation failed - backup may be incomplete")
+	} else {
+		s.Log().Debug("backup content validation passed - backup is complete")
 	}
 
 	return ad, nil
