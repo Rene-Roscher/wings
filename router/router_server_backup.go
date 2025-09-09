@@ -402,6 +402,11 @@ func postServerRestoreBackup(c *gin.Context) {
 			downloadReader = backup.NewDownloadProgressReader(res.Body, res.ContentLength, uuid, onProgress)
 		}
 		
+		// Pass download size through context for accurate restore progress
+		if res.ContentLength > 0 {
+			ctx = context.WithValue(ctx, "download_size", res.ContentLength)
+		}
+		
 		if err := s.RestoreBackupWithContext(ctx, s3Backup, downloadReader); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 			s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from S3 backup: " + err.Error())

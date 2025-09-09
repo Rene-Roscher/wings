@@ -574,28 +574,40 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	// Create progress instance for restore - estimate total from backup file size
 	restoreProgress := progress.NewProgress(0)
 
+	// Check if download size was passed through context (for S3 downloads)
+	var downloadSize int64
+	if ctxSize := ctx.Value("download_size"); ctxSize != nil {
+		if size, ok := ctxSize.(int64); ok && size > 0 {
+			downloadSize = size
+			s.Log().WithField("download_size", downloadSize).Debug("using download size from context for restore progress")
+		}
+	}
+	
 	// Try to get backup file size for percentage calculation
 	backupSize, err := b.Details(s.Context(), nil)
 	if err != nil {
 		s.Log().WithField("error", err).Debug("failed to get backup details for size")
 	}
 	
-	if err == nil && backupSize != nil && backupSize.Size > 0 {
-		// For restore progress, we track EXTRACTED bytes, not compressed bytes
-		// The extracted size is typically larger than compressed size
-		// Use a conservative 1.5x multiplier for better progress accuracy
-		// This is better than 2x which often overshoots
-		estimatedTotal := int64(float64(backupSize.Size) * 1.5)
-		restoreProgress.SetTotal(uint64(estimatedTotal))
+	// Determine the best size to use for progress tracking
+	var estimatedTotal int64
+	if downloadSize > 0 {
+		// For S3: Use actual download size with conservative multiplier for extraction
+		// Downloaded archives typically expand 3-4x when extracted (gzip/zstd compression)
+		// Using 3.2x gives good results without overshooting too much
+		estimatedTotal = int64(float64(downloadSize) * 3.2)
+		s.Log().WithField("download_size", downloadSize).WithField("estimated_restore_size", estimatedTotal).Info("set restore progress total from download size")
+	} else if err == nil && backupSize != nil && backupSize.Size > 0 {
+		// For local backups: Use backup file size with multiplier
+		estimatedTotal = int64(float64(backupSize.Size) * 1.5)
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Info("set restore progress total from backup size")
 	} else {
-		// If we can't get the size, use a reasonable estimate for progress tracking
-		// This ensures percentage calculation works even without knowing exact size
-		// We'll update it as we go
-		estimatedTotal := int64(10 * 1024 * 1024 * 1024) // 10GB estimate
-		restoreProgress.SetTotal(uint64(estimatedTotal))
+		// Fallback: Use a reasonable estimate
+		estimatedTotal = int64(10 * 1024 * 1024 * 1024) // 10GB estimate
 		s.Log().WithField("estimated_restore_size", estimatedTotal).Info("using estimated size for restore progress (backup size unavailable)")
 	}
+	
+	restoreProgress.SetTotal(uint64(estimatedTotal))
 
 	progressTracker = NewSimpleProgressTracker(ctx, s, b.Identifier(), "restore", restoreProgress)
 
