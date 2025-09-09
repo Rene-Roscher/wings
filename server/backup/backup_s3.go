@@ -323,7 +323,21 @@ func newS3FileUploader(file io.ReadCloser) *s3FileUploader {
 		// a 5GB file. This assumes at worst a 10Mbps connection for uploading. While technically
 		// you could go slower we're targeting mostly hosted servers that should have 100Mbps
 		// connections anyways.
-		client:          &http.Client{Timeout: time.Hour * 2},
+		client: &http.Client{
+			Timeout: time.Hour * 2,
+			Transport: &http.Transport{
+				// Force HTTP/1.1 to ensure streaming uploads work properly
+				ForceAttemptHTTP2: false,
+				// Disable buffering for request bodies
+				DisableCompression: true,
+				// Increase idle connections for better performance
+				MaxIdleConns:        10,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     90 * time.Second,
+				// Important: This enables streaming of request bodies
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
 		progressTracker: nil, // Set via WithProgressTracker method
 	}
 }
@@ -432,6 +446,12 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 		} else {
 			// Wrap with progress tracking for streaming upload
 			if fu.progressTracker != nil {
+				// Log that we're setting up progress tracking for large part
+				log.WithFields(log.Fields{
+					"part_size_mb": size / (1024 * 1024),
+					"has_callback": fu.progressCallback != nil,
+				}).Debug("S3: Setting up progress tracking for large part upload")
+				
 				progressReader := NewProgressReader(partReader, fu.progressTracker)
 				if fu.progressCallback != nil {
 					progressReader.WithCallback(fu.progressCallback)
@@ -542,6 +562,14 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 			isFirst := pr.lastCallback == 0
 			isLast := err == io.EOF
 			
+			// Debug log first read
+			if isFirst {
+				log.WithFields(log.Fields{
+					"bytes_read": n,
+					"total_written": bytesWritten,
+				}).Debug("S3 ProgressReader: First read from upload stream")
+			}
+			
 			var throttleInterval int64 = 250_000_000 // Default 250ms
 			if !isFirst && pr.lastCallback > 0 {
 				// Calculate upload speed based on bytes since last callback
@@ -561,6 +589,16 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 			if shouldSend {
 				pr.lastCallback = now
 				pr.lastBytesWritten = bytesWritten
+				
+				// Debug log callback trigger
+				if isFirst || isLast {
+					log.WithFields(log.Fields{
+						"is_first": isFirst,
+						"is_last": isLast,
+						"bytes_written": bytesWritten,
+					}).Debug("S3 ProgressReader: Triggering progress callback")
+				}
+				
 				// Recover from panic in callback - progress events must never break uploads
 				func() {
 					defer func() {
