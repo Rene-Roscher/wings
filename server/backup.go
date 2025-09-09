@@ -581,8 +581,11 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	}
 	
 	if err == nil && backupSize != nil && backupSize.Size > 0 {
-		// Estimate uncompressed size (tar.gz expansion ~2x)
-		estimatedTotal := backupSize.Size * 2
+		// For restore progress, we track EXTRACTED bytes, not compressed bytes
+		// The extracted size is typically larger than compressed size
+		// Use a conservative 1.5x multiplier for better progress accuracy
+		// This is better than 2x which often overshoots
+		estimatedTotal := int64(float64(backupSize.Size) * 1.5)
 		restoreProgress.SetTotal(uint64(estimatedTotal))
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Info("set restore progress total from backup size")
 	} else {

@@ -89,57 +89,67 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 			atomic.StoreInt64(&spt.lastSent, int64(percentage))
 		}
 
-		// Context-aware async send with proper lifecycle management
+		// Check context before sending
 		if spt.ctx != nil {
 			select {
 			case <-spt.ctx.Done():
-				return // Don't spawn goroutine if context is cancelled
+				return // Context cancelled, skip event
 			default:
 			}
 		}
 		
-		spt.wg.Add(1)
-		go func(p int, w, t int64, isFinal, isInitial bool) {
-			defer spt.wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					return // Minimal recovery overhead
+		// CRITICAL FIX: Send events SYNCHRONOUSLY during normal progress
+		// Only the FINAL events truly need to be async to avoid blocking restore completion
+		// Regular progress events are fast enough to send inline
+		update := BackupProgressUpdate{
+			BackupID:     spt.backupID,
+			Type:         spt.backupType,
+			Percentage:   percentage,
+			BytesWritten: written,
+			BytesTotal:   total,
+		}
+
+		// For FINAL progress, we still use async to not block the restore completion
+		// But for normal progress, send synchronously to avoid goroutine accumulation
+		if isFinalProgress {
+			// Only spawn goroutine for final event to avoid blocking restore
+			spt.wg.Add(1)
+			go func() {
+				defer spt.wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						return
+					}
+				}()
+				
+				// Final check before send
+				if spt.ctx != nil {
+					select {
+					case <-spt.ctx.Done():
+						return
+					default:
+					}
 				}
+				
+				spt.server.Events().Publish(BackupProgressEvent, update)
+				spt.server.Log().WithField("backup_id", spt.backupID).
+					WithField("percentage", percentage).
+					WithField("bytes_written", written).
+					WithField("bytes_total", total).
+					Info("sent FINAL backup progress event")
 			}()
-			
-			// Check context before expensive operations
-			if spt.ctx != nil {
-				select {
-				case <-spt.ctx.Done():
-					return
-				default:
-				}
-			}
-
-			update := BackupProgressUpdate{
-				BackupID:     spt.backupID,
-				Type:         spt.backupType,
-				Percentage:   p,
-				BytesWritten: w,
-				BytesTotal:   t,
-			}
-
+		} else {
+			// Send normal progress events synchronously - they're fast!
 			spt.server.Events().Publish(BackupProgressEvent, update)
 			
-			// Enhanced debugging for critical events
-			if isFinal {
+			// Log initial event for debugging
+			if isInitialProgress {
 				spt.server.Log().WithField("backup_id", spt.backupID).
-					WithField("percentage", p).
-					WithField("bytes_written", w).
-					WithField("bytes_total", t).
-					Info("sent FINAL backup progress event")
-			} else if isInitial {
-				spt.server.Log().WithField("backup_id", spt.backupID).
-					WithField("percentage", p).
-					WithField("bytes_total", t).
+					WithField("percentage", percentage).
+					WithField("bytes_total", total).
 					Debug("sent INITIAL backup progress event")
 			}
-		}(percentage, written, total, isFinalProgress, isInitialProgress)
+		}
 	}
 }
 
@@ -158,11 +168,31 @@ func NewSimpleProgressTracker(ctx context.Context, server *Server, backupID, bac
 
 // Close cleans up all goroutines and resources
 func (spt *SimpleProgressTracker) Close() {
+	// Cancel context first to signal all goroutines to stop
 	if spt.cancel != nil {
 		spt.cancel()
 		spt.cancel = nil // Prevent double-cancel
 	}
-	spt.wg.Wait() // Wait for all goroutines to finish
+	
+	// Wait for any pending CheckProgress goroutines with SHORT timeout
+	// These are fire-and-forget event sends, we don't need to wait long
+	done := make(chan struct{})
+	go func() {
+		spt.wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		// All goroutines finished cleanly
+	case <-time.After(100 * time.Millisecond):
+		// Very short timeout - these are just event sends
+		// If they're not done in 100ms, they're stuck and we move on
+		// This prevents blocking the entire restore operation
+		if spt.server != nil {
+			spt.server.Log().Debug("progress tracker closed with pending events")
+		}
+	}
 }
 
 // SendFinalProgress - call when backup completes
@@ -197,52 +227,19 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		BytesTotal:   total,
 	}
 
-	// Send final progress with context awareness
+	// Send final progress SYNCHRONOUSLY - no goroutine!
+	// This is the FINAL event, we don't need async here
 	if spt.ctx != nil {
 		select {
 		case <-spt.ctx.Done():
-			return // Don't send if context is cancelled
+			spt.server.Log().Warn("context cancelled, skipping final progress event")
+			return
 		default:
 		}
 	}
 	
-	spt.wg.Add(1)
-	go func() {
-		defer spt.wg.Done()
-		defer func() {
-			recover() // Silent recovery - progress failures must never break backups
-		}()
-		
-		// Final context check
-		if spt.ctx != nil {
-			select {
-			case <-spt.ctx.Done():
-				return
-			default:
-			}
-		}
-		
-		spt.server.Events().Publish(BackupProgressEvent, update)
-	}()
+	// Send the final event directly - this is fast enough
+	spt.server.Events().Publish(BackupProgressEvent, update)
 	
-	// Close after final progress with managed goroutine
-	spt.wg.Add(1)
-	go func() {
-		defer spt.wg.Done()
-		defer func() {
-			recover() // Silent recovery
-		}()
-		
-		// Use context-aware sleep instead of time.Sleep
-		timer := time.NewTimer(100 * time.Millisecond)
-		defer timer.Stop()
-		
-		select {
-		case <-timer.C:
-			spt.Close()
-		case <-spt.ctx.Done():
-			spt.Close() // Still close even if context cancelled
-			return
-		}
-	}()
+	// NO MORE GOROUTINES HERE! The caller will handle Close()
 }
