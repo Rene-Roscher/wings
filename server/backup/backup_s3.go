@@ -25,6 +25,8 @@ type S3Backup struct {
 	Backup
 	// Progress tracker for upload phase (optional)
 	uploadProgress ProgressTracker
+	// Content length for download progress tracking (optional)
+	downloadContentLength int64
 }
 
 // ProgressTracker interface for S3 upload progress tracking
@@ -45,13 +47,20 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 			Ignore:  ignore,
 			adapter: S3BackupAdapter,
 		},
-		uploadProgress: nil, // Set via WithUploadProgress method
+		uploadProgress:        nil, // Set via WithUploadProgress method
+		downloadContentLength: 0,   // Set via WithDownloadContentLength method
 	}
 }
 
 // WithUploadProgress sets the progress tracker for S3 upload phase
 func (s *S3Backup) WithUploadProgress(progress ProgressTracker) *S3Backup {
 	s.uploadProgress = progress
+	return s
+}
+
+// WithDownloadContentLength sets the content length for download progress tracking
+func (s *S3Backup) WithDownloadContentLength(contentLength int64) *S3Backup {
+	s.downloadContentLength = contentLength
 	return s
 }
 
@@ -163,8 +172,27 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 	}
 	s.log().WithField("format", format).Debug("S3 restore: detected compression format")
 	
+	// NOW we can wrap with progress tracking AFTER format detection!
+	// The detectedReader already has the format bytes consumed
+	var finalReader io.ReadCloser = detectedReader
+	
+	// Add download progress tracking if we have content length
+	if s.downloadContentLength > 0 {
+		s.log().WithField("content_length_mb", s.downloadContentLength/(1024*1024)).Debug("S3 restore: adding download progress tracking")
+		
+		// Create progress callback for download phase
+		// This provides visibility into download progress via logs
+		// The actual restore progress (extraction) happens separately
+		onProgress := func(downloaded, total int64) {
+			// Log progress at key milestones (handled inside DownloadProgressReader)
+			// The reader already throttles to avoid spam
+		}
+		
+		finalReader = NewDownloadProgressReader(detectedReader, s.downloadContentLength, s.Uuid, onProgress)
+	}
+	
 	s.log().Debug("S3 restore: creating decompressor")
-	decompressedReader, err := filesystem.CreateDecompressor(detectedReader, format)
+	decompressedReader, err := filesystem.CreateDecompressor(finalReader, format)
 	if err != nil {
 		s.log().WithField("error", err).Error("S3 restore: failed to create decompressor")
 		return errors.WrapIf(err, "failed to create decompressor for S3 backup")
