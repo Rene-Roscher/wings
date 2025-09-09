@@ -25,8 +25,6 @@ type S3Backup struct {
 	Backup
 	// Progress tracker for upload phase (optional)
 	uploadProgress ProgressTracker
-	// Content length for download progress tracking (optional)
-	downloadContentLength int64
 }
 
 // ProgressTracker interface for S3 upload progress tracking
@@ -47,20 +45,13 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 			Ignore:  ignore,
 			adapter: S3BackupAdapter,
 		},
-		uploadProgress:        nil, // Set via WithUploadProgress method
-		downloadContentLength: 0,   // Set via WithDownloadContentLength method
+		uploadProgress: nil, // Set via WithUploadProgress method
 	}
 }
 
 // WithUploadProgress sets the progress tracker for S3 upload phase
 func (s *S3Backup) WithUploadProgress(progress ProgressTracker) *S3Backup {
 	s.uploadProgress = progress
-	return s
-}
-
-// WithDownloadContentLength sets the content length for download progress tracking
-func (s *S3Backup) WithDownloadContentLength(contentLength int64) *S3Backup {
-	s.downloadContentLength = contentLength
 	return s
 }
 
@@ -146,66 +137,46 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	return ad, nil
 }
 
-// Restore will read from the provided reader assuming that it is a gzipped
-// tar reader. When a file is encountered in the archive the callback function
-// will be triggered. If the callback returns an error the entire process is
-// stopped, otherwise this function will run until all files have been written.
+// Restore will read from the provided reader which should be a TAR archive.
+// IMPORTANT: For S3 restores, the server layer has already handled decompression,
+// so we receive a decompressed TAR stream ready for extraction.
 //
-// This restoration uses a workerpool to use up to the number of CPUs available
-// on the machine when writing files to the disk.
+// When a file is encountered in the archive the callback function will be triggered.
+// If the callback returns an error the entire process is stopped.
 func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
 	s.log().Debug("S3 restore: starting restore process")
-	reader := r
-	// Steal the logic we use for making backups which will be applied when restoring
-	// this specific backup. This allows us to prevent overloading the disk unintentionally.
+	
+	// CRITICAL: The reader provided here is ALREADY DECOMPRESSED by the server layer!
+	// The server's RestoreBackupWithContext method handles:
+	// 1. Format detection (gzip, zstd, etc.)
+	// 2. Decompression
+	// 3. Passing us the clean TAR stream
+	//
+	// We should NOT attempt format detection or decompression here!
+	
+	// Start with the provided reader (already decompressed TAR stream)
+	finalReader := r
+	
+	// Apply write rate limiting to prevent disk overload
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		s.log().WithField("write_limit_mb", writeLimit/1024/1024).Debug("S3 restore: applying write rate limit")
-		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+		finalReader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
 	
-	s.log().Debug("S3 restore: detecting compression format")
-	// Auto-detect compression format and decompress
-	format, detectedReader, err := filesystem.DetectCompressionFormat(io.NopCloser(reader))
-	if err != nil {
-		s.log().WithField("error", err).Error("S3 restore: failed to detect compression format")
-		return errors.WrapIf(err, "failed to detect S3 backup compression format")
-	}
-	s.log().WithField("format", format).Debug("S3 restore: detected compression format")
-	
-	// NOW we can wrap with progress tracking AFTER format detection!
-	// The detectedReader already has the format bytes consumed
-	var finalReader io.ReadCloser = detectedReader
-	
-	// Add download progress tracking if we have content length
-	if s.downloadContentLength > 0 {
-		s.log().WithField("content_length_mb", s.downloadContentLength/(1024*1024)).Debug("S3 restore: adding download progress tracking")
-		
-		// Create progress callback for download phase
-		// This provides visibility into download progress via logs
-		// The actual restore progress (extraction) happens separately
-		onProgress := func(downloaded, total int64) {
-			// Log progress at key milestones (handled inside DownloadProgressReader)
-			// The reader already throttles to avoid spam
-		}
-		
-		finalReader = NewDownloadProgressReader(detectedReader, s.downloadContentLength, s.Uuid, onProgress)
-	}
-	
-	s.log().Debug("S3 restore: creating decompressor")
-	decompressedReader, err := filesystem.CreateDecompressor(finalReader, format)
-	if err != nil {
-		s.log().WithField("error", err).Error("S3 restore: failed to create decompressor")
-		return errors.WrapIf(err, "failed to create decompressor for S3 backup")
-	}
-	defer decompressedReader.Close()
+	// Note: Download progress tracking doesn't make sense here because:
+	// 1. We're receiving an already-decompressed stream
+	// 2. The actual download happens in the router layer
+	// 3. The size would be the decompressed size, not download size
+	// Progress tracking for restore happens at the file extraction level in the server layer
 	
 	s.log().Debug("S3 restore: starting TAR archive extraction")
 	// Use the mholt/archives package to extract TAR archive
+	// The reader is already decompressed, just extract the TAR
 	tarFormat := archives.Tar{}
 	fileCount := 0
 	totalBytes := uint64(0)
 	
-	if err := tarFormat.Extract(ctx, decompressedReader, func(ctx context.Context, f archives.FileInfo) error {
+	if err := tarFormat.Extract(ctx, finalReader, func(ctx context.Context, f archives.FileInfo) error {
 		fileCount++
 		totalBytes += uint64(f.Size())
 		

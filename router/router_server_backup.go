@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -367,18 +368,36 @@ func postServerRestoreBackup(c *gin.Context) {
 
 		logger.WithField("content_length", res.ContentLength).Info("starting restoration process for server backup using S3 driver")
 		
-		// CRITICAL: DO NOT WRAP res.Body with progress tracking!
-		// The S3Backup.Restore needs raw bytes for format detection.
-		// Progress tracking happens INSIDE S3Backup.Restore after format detection.
-		
-		// Create S3 backup with download content length for progress tracking
+		// Create S3 backup instance
 		s3Backup := backup.NewS3(client, uuid, "")
+		
+		// Wrap response body with download progress tracking if we know the size
+		var downloadReader io.ReadCloser = res.Body
 		if res.ContentLength > 0 {
-			logger.WithField("size_mb", res.ContentLength/(1024*1024)).Info("S3 backup download size known, enabling progress tracking")
-			s3Backup.WithDownloadContentLength(res.ContentLength)
+			logger.WithField("size_mb", res.ContentLength/(1024*1024)).Info("S3 backup download size known, adding download progress tracking")
+			
+			// Progress callback for download tracking
+			onProgress := func(downloaded, total int64) {
+				// Calculate download percentage (0-80% for download, 80-100% for extraction)
+				percentage := 0
+				if total > 0 {
+					percentage = int((downloaded * 80) / total)
+				}
+				
+				// Log progress (WebSocket events are handled by server layer)
+				if percentage%10 == 0 {
+					logger.WithFields(log.Fields{
+						"downloaded_percentage": percentage,
+						"downloaded_mb": downloaded / (1024 * 1024),
+						"total_mb": total / (1024 * 1024),
+					}).Debug("S3 download progress")
+				}
+			}
+			
+			downloadReader = backup.NewDownloadProgressReader(res.Body, res.ContentLength, uuid, onProgress)
 		}
 		
-		if err := s.RestoreBackupWithContext(ctx, s3Backup, res.Body); err != nil {
+		if err := s.RestoreBackupWithContext(ctx, s3Backup, downloadReader); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 			s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from S3 backup: " + err.Error())
 			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
