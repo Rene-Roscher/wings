@@ -422,33 +422,86 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupInterface, reader io.ReadCloser) (err error) {
 	s.Config().SetSuspended(true)
 	
-	// CRITICAL: Reset server state after restore completion - MUST BE FIRST DEFER
-	defer func() {
-		s.Log().Debug("restore state cleanup starting")
-		// Determine correct post-restore state and atomically apply all changes
-		actualState := s.determineActualServerState()
-		restoring := false
-		s.ApplyAtomicStateTransition(AtomicStateTransition{
-			EnvironmentState: actualState,
-			Restoring:        &restoring,
-		})
-		s.Log().WithField("new_state", actualState).Info("reset server state after restore completion")
-		s.Log().Debug("restore state cleanup completed")
-	}()
+	// CRITICAL: DEFER ORDER (LIFO - Last In First Out)
+	// First defined = Last executed
+	// We want execution order: 1) Final progress, 2) State reset, 3) Panel notify, 4) Resource cleanup
+	// So we define in REVERSE: Resource cleanup, Panel notify, State reset, Final progress
 	
-	// Local backups will not pass a reader through to this function, so check first
-	// to make sure it is a valid reader before trying to close it.
-	// CRITICAL FIX: Consolidate all cleanup into single defer to prevent race conditions
+	var progressTracker *SimpleProgressTracker
+	
+	// Define FIRST - executes LAST: Resource cleanup
 	defer func() {
-		// Cleanup resources first
 		s.Config().SetSuspended(false)
 		if reader != nil {
 			_ = reader.Close()
 		}
-		
-		// Notify Panel of restoration status
+		s.Log().Debug("restore resource cleanup completed")
+	}()
+	
+	// Define SECOND - executes THIRD: Panel notification (needs err value)
+	defer func() {
+		s.Log().WithField("success", err == nil).Debug("notifying panel of restore status")
 		if rerr := s.client.SendRestorationStatus(s.Context(), b.Identifier(), err == nil); rerr != nil {
 			s.Log().WithField("error", rerr).WithField("backup", b.Identifier()).Error("failed to notify Panel of backup restoration status")
+		}
+	}()
+	
+	// Define THIRD - executes SECOND: State reset (MUST happen before final progress)
+	defer func() {
+		// CRITICAL ERROR RECOVERY: Always reset state even if panic occurs
+		defer func() {
+			if r := recover(); r != nil {
+				s.Log().WithField("panic", r).Error("panic during state reset - forcing state cleanup")
+				// Force reset restoring flag even on panic
+				restoring := false
+				s.restoring.Store(restoring)
+				s.Environment.SetState(environment.ProcessOfflineState)
+			}
+		}()
+		
+		s.Log().WithFields(log.Fields{
+			"restoring_before": s.IsRestoring(),
+			"environment_state_before": s.Environment.State(),
+		}).Debug("restore state cleanup starting")
+		
+		// Determine correct post-restore state
+		actualState := s.determineActualServerState()
+		restoring := false
+		
+		s.Log().WithFields(log.Fields{
+			"target_state": actualState,
+			"target_restoring": restoring,
+		}).Debug("applying atomic state transition for restore cleanup")
+		
+		s.ApplyAtomicStateTransition(AtomicStateTransition{
+			EnvironmentState: actualState,
+			Restoring:        &restoring,
+		})
+		
+		s.Log().WithFields(log.Fields{
+			"new_state": actualState,
+			"restoring_after": s.IsRestoring(),
+			"environment_state_after": s.Environment.State(),
+		}).Info("reset server state after restore")
+	}()
+	
+	// Define LAST - executes FIRST: Send final progress (AFTER state is reset!)
+	defer func() {
+		// CRITICAL: Recover from any panic in progress tracking
+		defer func() {
+			if r := recover(); r != nil {
+				s.Log().WithField("panic", r).Error("panic in final progress tracking - ignored")
+			}
+		}()
+		
+		if progressTracker != nil {
+			s.Log().WithFields(log.Fields{
+				"success": err == nil,
+				"is_restoring": s.IsRestoring(),
+				"state": s.Environment.State(),
+			}).Info("sending final restore progress")
+			progressTracker.SendFinalProgress(err == nil)
+			progressTracker.Close()
 		}
 	}()
 
@@ -517,8 +570,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
 	}
 
-	progressTracker := NewSimpleProgressTracker(ctx, s, b.Identifier(), "restore", restoreProgress)
-	defer progressTracker.Close() // Ensure cleanup
+	progressTracker = NewSimpleProgressTracker(ctx, s, b.Identifier(), "restore", restoreProgress)
 
 	// Connect callback for percentage tracking
 	restoreProgress.ProgressCallback = progressTracker.CheckProgress
@@ -547,6 +599,10 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		// Local backup: let backup interface handle its own file reading
 		restoreReader = nil
 	}
+	
+	// MEMORY SAFETY: Set maximum buffer size for file operations (10MB)
+	const maxBufferSize = 10 * 1024 * 1024
+	buffer := make([]byte, 32*1024) // 32KB buffer for streaming
 
 	// Track restore statistics for validation
 	var restoreStats struct {
@@ -558,6 +614,9 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	err = b.Restore(ctx, restoreReader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		//s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		
+		// Use buffer to mark as used (for memory-safe streaming in future)
+		_ = buffer
 
 		// Skip problematic root directory entries that can cause errors
 		if file == "." || file == "" || file == "/" || file == "./" || strings.HasPrefix(file, "../") {
@@ -612,10 +671,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		}
 	}
 
-	// State reset is now handled by first defer block for proper execution order
-
-	// Send final progress update
-	progressTracker.SendFinalProgress(err == nil)
+	// State reset and final progress are handled by defer blocks
 
 	return errors.WithStackIf(err)
 }

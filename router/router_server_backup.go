@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -244,6 +245,11 @@ func postServerRestoreBackup(c *gin.Context) {
 					"error": err.Error(),
 				})
 			} else {
+				logger.WithFields(log.Fields{
+					"is_restoring": s.IsRestoring(),
+					"server_state": s.Environment.State(),
+				}).Info("Local restore completed successfully - sending completion events")
+				
 				s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
 				s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
 					"successful": true,
@@ -267,20 +273,35 @@ func postServerRestoreBackup(c *gin.Context) {
 			DisableCompression:  true, // Backup files are already compressed
 		},
 	}
-	logger.Info("downloading backup from remote location...")
+	logger.WithField("download_url", data.DownloadUrl).Info("downloading backup from remote location...")
 	// Use proper timeout to prevent indefinite hangs during backup downloads.
 	// 2 hour timeout should be sufficient for most backup file sizes while preventing
 	// resource exhaustion from stuck connections.
 	req, err := http.NewRequestWithContext(s.Context(), http.MethodGet, data.DownloadUrl, nil)
 	if err != nil {
+		logger.WithField("error", err).Error("failed to create HTTP request for backup download")
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	
+	logger.Debug("executing HTTP request for backup download")
+	downloadStart := time.Now()
 	res, err := httpClient.Do(req)
 	if err != nil {
+		logger.WithFields(log.Fields{
+			"error": err,
+			"duration_ms": time.Since(downloadStart).Milliseconds(),
+		}).Error("HTTP request failed for backup download")
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	
+	logger.WithFields(log.Fields{
+		"status_code": res.StatusCode,
+		"content_length": res.ContentLength,
+		"content_type": res.Header.Get("Content-Type"),
+		"duration_ms": time.Since(downloadStart).Milliseconds(),
+	}).Info("received HTTP response for backup download")
 	
 	// CRITICAL: Ensure response body is always closed in error paths before goroutine takes ownership
 	var goroutineStarted bool
@@ -345,8 +366,31 @@ func postServerRestoreBackup(c *gin.Context) {
 		ctx, timeoutCancel := context.WithTimeout(ctx, 4*time.Hour)
 		defer timeoutCancel()
 
-		logger.Info("starting restoration process for server backup using S3 driver")
-		if err := s.RestoreBackupWithContext(ctx, backup.NewS3(client, uuid, ""), res.Body); err != nil {
+		logger.WithField("content_length", res.ContentLength).Info("starting restoration process for server backup using S3 driver")
+		
+		// Create a progress-tracking reader for S3 download if we know the size
+		var bodyReader io.ReadCloser = res.Body
+		if res.ContentLength > 0 {
+			// Track S3 download progress (first 50% of total restore progress)
+			bodyReader = backup.NewDownloadProgressReader(res.Body, res.ContentLength, uuid, func(downloaded, total int64) {
+				if total > 0 {
+					// Download is 0-50% of total restore progress
+					downloadPercentage := (downloaded * 50) / total
+					
+					// Send progress event for download phase
+					s.Events().Publish(server.BackupProgressEvent, server.BackupProgressUpdate{
+						BackupID:     uuid,
+						Type:         "restore",
+						Percentage:   int(downloadPercentage),
+						BytesWritten: downloaded,
+						BytesTotal:   total * 2, // Total includes extraction which roughly doubles size
+					})
+				}
+			})
+			logger.WithField("size_mb", res.ContentLength/(1024*1024)).Info("S3 download progress tracking enabled")
+		}
+		
+		if err := s.RestoreBackupWithContext(ctx, backup.NewS3(client, uuid, ""), bodyReader); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 			s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from S3 backup: " + err.Error())
 			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
@@ -354,6 +398,11 @@ func postServerRestoreBackup(c *gin.Context) {
 				"error": err.Error(),
 			})
 		} else {
+			logger.WithFields(log.Fields{
+				"is_restoring": s.IsRestoring(),
+				"server_state": s.Environment.State(),
+			}).Info("S3 restore completed successfully - sending completion events")
+			
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
 			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
 				"successful": true,

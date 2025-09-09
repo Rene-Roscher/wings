@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
@@ -144,37 +145,94 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 // This restoration uses a workerpool to use up to the number of CPUs available
 // on the machine when writing files to the disk.
 func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
+	s.log().Debug("S3 restore: starting restore process")
 	reader := r
 	// Steal the logic we use for making backups which will be applied when restoring
 	// this specific backup. This allows us to prevent overloading the disk unintentionally.
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
+		s.log().WithField("write_limit_mb", writeLimit/1024/1024).Debug("S3 restore: applying write rate limit")
 		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
+	
+	s.log().Debug("S3 restore: detecting compression format")
 	// Auto-detect compression format and decompress
 	format, detectedReader, err := filesystem.DetectCompressionFormat(io.NopCloser(reader))
 	if err != nil {
+		s.log().WithField("error", err).Error("S3 restore: failed to detect compression format")
 		return errors.WrapIf(err, "failed to detect S3 backup compression format")
 	}
+	s.log().WithField("format", format).Debug("S3 restore: detected compression format")
 	
+	s.log().Debug("S3 restore: creating decompressor")
 	decompressedReader, err := filesystem.CreateDecompressor(detectedReader, format)
 	if err != nil {
+		s.log().WithField("error", err).Error("S3 restore: failed to create decompressor")
 		return errors.WrapIf(err, "failed to create decompressor for S3 backup")
 	}
 	defer decompressedReader.Close()
 	
+	s.log().Debug("S3 restore: starting TAR archive extraction")
 	// Use the mholt/archives package to extract TAR archive
 	tarFormat := archives.Tar{}
+	fileCount := 0
+	totalBytes := uint64(0)
+	
 	if err := tarFormat.Extract(ctx, decompressedReader, func(ctx context.Context, f archives.FileInfo) error {
+		fileCount++
+		totalBytes += uint64(f.Size())
+		
+		// Log every 100 files or every 100MB to track progress
+		if fileCount%100 == 0 || totalBytes%(100*1024*1024) < uint64(f.Size()) {
+			s.log().WithFields(log.Fields{
+				"files_processed": fileCount,
+				"total_bytes_mb":  totalBytes / (1024 * 1024),
+				"current_file":    f.NameInArchive,
+			}).Debug("S3 restore: extraction progress")
+		}
+		
 		r, err := f.Open()
 		if err != nil {
+			s.log().WithFields(log.Fields{
+				"file": f.NameInArchive,
+				"error": err,
+			}).Error("S3 restore: failed to open file from archive")
 			return err
 		}
 		defer r.Close()
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+		// DIRECT CALLBACK - no goroutine needed!
+		// The callback should be fast and context-aware itself
+		if err := callback(f.NameInArchive, f.FileInfo, r); err != nil {
+			s.log().WithFields(log.Fields{
+				"file": f.NameInArchive,
+				"error": err,
+			}).Error("S3 restore: callback failed for file")
+			return err
+		}
+		
+		// Check context after each file
+		select {
+		case <-ctx.Done():
+			s.log().WithField("file", f.NameInArchive).Warn("S3 restore: context cancelled during extraction")
+			return ctx.Err()
+		default:
+			// Continue processing
+		}
+		
+		return nil
 	}); err != nil {
+		s.log().WithFields(log.Fields{
+			"files_processed": fileCount,
+			"total_bytes_mb":  totalBytes / (1024 * 1024),
+			"error": err,
+		}).Error("S3 restore: TAR extraction failed")
 		return err
 	}
+	
+	s.log().WithFields(log.Fields{
+		"files_processed": fileCount,
+		"total_bytes_mb":  totalBytes / (1024 * 1024),
+	}).Info("S3 restore: completed successfully")
 	return nil
 }
 

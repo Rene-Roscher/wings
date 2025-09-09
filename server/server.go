@@ -88,21 +88,39 @@ type AtomicStateTransition struct {
 
 // ApplyAtomicStateTransition atomically applies state changes to prevent race conditions
 func (s *Server) ApplyAtomicStateTransition(transition AtomicStateTransition) {
+	s.Log().WithFields(log.Fields{
+		"before_backing_up":   s.backingUp.Load(),
+		"before_restoring":    s.restoring.Load(),
+		"before_transferring": s.transferring.Load(),
+		"before_env_state":    s.Environment.State(),
+	}).Debug("ATOMIC STATE TRANSITION: before")
+	
 	// Apply all atomic state changes together
 	if transition.BackingUp != nil {
+		s.Log().WithField("new_backing_up", *transition.BackingUp).Debug("setting BackingUp flag")
 		s.backingUp.Store(*transition.BackingUp)
 	}
 	if transition.Restoring != nil {
+		s.Log().WithField("new_restoring", *transition.Restoring).Debug("setting Restoring flag")
 		s.restoring.Store(*transition.Restoring)
 	}
 	if transition.Transferring != nil {
+		s.Log().WithField("new_transferring", *transition.Transferring).Debug("setting Transferring flag")
 		s.transferring.Store(*transition.Transferring)
 	}
 	
 	// Finally set environment state
 	if transition.EnvironmentState != "" {
+		s.Log().WithField("new_env_state", transition.EnvironmentState).Debug("setting Environment state")
 		s.Environment.SetState(transition.EnvironmentState)
 	}
+	
+	s.Log().WithFields(log.Fields{
+		"after_backing_up":   s.backingUp.Load(),
+		"after_restoring":    s.restoring.Load(),
+		"after_transferring": s.transferring.Load(),
+		"after_env_state":    s.Environment.State(),
+	}).Debug("ATOMIC STATE TRANSITION: after")
 }
 
 // New returns a new server instance with a context and all of the default

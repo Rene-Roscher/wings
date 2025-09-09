@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apex/log"
 	"github.com/Rene-Roscher/wings/internal/progress"
 )
 
@@ -176,6 +177,17 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		written = int64(spt.progress.Written())
 		total = int64(spt.progress.Total())
 	}
+
+	spt.server.Log().WithFields(log.Fields{
+		"backup_id":     spt.backupID,
+		"backup_type":   spt.backupType,
+		"success":       success,
+		"percentage":    percentage,
+		"written":       written,
+		"total":         total,
+		"is_restoring":  spt.server.IsRestoring(),
+		"server_state":  spt.server.Environment.State(),
+	}).Info("SENDING FINAL PROGRESS EVENT")
 
 	update := BackupProgressUpdate{
 		BackupID:     spt.backupID,
