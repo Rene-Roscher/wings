@@ -68,22 +68,31 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		
 		// S3 SPECIAL CASE: Scale to 80% during archive, then 80-100% during upload
 		if spt.isS3 {
-			// During archive phase (before SetS3Mode is called with actual size)
 			if spt.archiveSize == 0 {
-				// Archive phase: scale 0-100% to 0-80%
-				percentage = min(80, (rawPercentage * 80) / 100)
-			} else {
-				// Upload phase: we know the actual archive size now
-				// Archive bytes are already written, now tracking upload
-				archiveBytes := total // The original total was the archive content
-				uploadBytes := written - archiveBytes
-				if uploadBytes > 0 {
-					// Upload progress: 80% + (upload_progress * 20%)
-					uploadPercent := int((uploadBytes * 100) / spt.archiveSize)
-					percentage = 80 + min(20, (uploadPercent * 20) / 100)
+				// Archive phase: written goes from 0 to 2×total
+				// Scale this to 0-80%
+				if written >= total*2 {
+					percentage = 80 // Cap at 80% when archive is done
 				} else {
-					// Still in archive phase or just finished
-					percentage = 80
+					// Scale 0 to 2×total => 0 to 80%
+					percentage = int((written * 80) / (total * 2))
+				}
+			} else {
+				// Upload phase: written goes from 2×total to 2×total+archiveSize
+				// Scale this to 80-100%
+				doubleTotal := total * 2
+				if written <= doubleTotal {
+					percentage = 80 // Still at 80% if upload hasn't started
+				} else {
+					// Upload progress: how much of the archive have we uploaded?
+					uploadBytes := written - doubleTotal
+					if uploadBytes >= spt.archiveSize {
+						percentage = 100 // Upload complete
+					} else {
+						// Scale upload progress (0 to archiveSize) to (80% to 100%)
+						uploadPercent := int((uploadBytes * 20) / spt.archiveSize)
+						percentage = 80 + uploadPercent
+					}
 				}
 			}
 		} else {
