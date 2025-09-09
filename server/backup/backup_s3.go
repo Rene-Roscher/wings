@@ -84,16 +84,36 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 		// On failure, backup file is kept for debugging/retry
 	}()
 
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
-	}
+	// Check if backup archive already exists (S3 two-phase backup)
+	if _, err := os.Stat(s.Path()); os.IsNotExist(err) {
+		// Archive doesn't exist - create it (single-phase backup)
+		a := &filesystem.Archive{
+			Filesystem: fsys,
+			Ignore:     ignore,
+		}
 
-	s.log().WithField("path", s.Path()).Info("creating backup for server")
-	if err := a.Create(ctx, s.Path()); err != nil {
-		return nil, err
+		s.log().WithField("path", s.Path()).Info("creating backup for server")
+		if err := a.Create(ctx, s.Path()); err != nil {
+			return nil, err
+		}
+		s.log().Info("created backup successfully")
+	} else if err != nil {
+		// Handle other stat errors (permissions, etc)
+		s.log().WithField("error", err).Warn("failed to stat backup file - attempting to create anyway")
+		a := &filesystem.Archive{
+			Filesystem: fsys,
+			Ignore:     ignore,
+		}
+
+		s.log().WithField("path", s.Path()).Info("creating backup for server (stat failed)")
+		if err := a.Create(ctx, s.Path()); err != nil {
+			return nil, err
+		}
+		s.log().Info("created backup successfully")
+	} else {
+		// Archive already exists - proceed with upload (two-phase backup)
+		s.log().WithField("path", s.Path()).Info("using existing backup archive for S3 upload")
 	}
-	s.log().Info("created backup successfully")
 
 	rc, err := os.Open(s.Path())
 	if err != nil {

@@ -104,8 +104,10 @@ func postServerBackup(c *gin.Context) {
 		}
 		// Defer cleanup - will run AFTER backup completes
 		defer func() {
+			logger.Debug("backup goroutine cleanup starting")
 			registry.Complete(data.Uuid)
 			cancel() // Cancel AFTER marking complete
+			logger.Debug("backup goroutine cleanup completed")
 		}()
 
 		// Add timeout if not already set
@@ -114,6 +116,15 @@ func postServerBackup(c *gin.Context) {
 
 		if err := s.BackupWithRetry(ctx, b, 2); err != nil {
 			logger.WithField("error", errors.WithStackIf(err)).Error("router: failed to generate server backup after retries")
+			
+			// Send failure event to ensure frontend gets notified
+			s.Events().Publish(server.BackupCompletedEvent, map[string]any{
+				"uuid":          data.Uuid,
+				"is_successful": false,
+				"error":         err.Error(),
+			})
+		} else {
+			logger.Info("backup completed successfully")
 		}
 	}(adapter, s, logger)
 
@@ -213,8 +224,10 @@ func postServerRestoreBackup(c *gin.Context) {
 				if r := recover(); r != nil {
 					logger.WithField("panic", r).Error("restore operation panicked")
 				}
+				logger.Debug("local restore goroutine cleanup starting")
 				registry.Complete(c.Param("backup"))
 				cancel() // Cancel AFTER marking complete
+				logger.Debug("local restore goroutine cleanup completed")
 				// Note: SetRestoring is now handled atomically within the restore function
 			}()
 
@@ -321,8 +334,10 @@ func postServerRestoreBackup(c *gin.Context) {
 			if r := recover(); r != nil {
 				logger.WithField("panic", r).Error("S3 restore operation panicked")
 			}
+			logger.Debug("S3 restore goroutine cleanup starting")
 			registry.Complete(uuid)
 			cancel() // Cancel AFTER marking complete
+			logger.Debug("S3 restore goroutine cleanup completed")
 			// Note: SetRestoring is now handled atomically within the restore function
 		}()
 

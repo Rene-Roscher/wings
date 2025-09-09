@@ -119,6 +119,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 
 	// ATOMIC: Ensure proper cleanup with atomic state transition
 	defer func() {
+		s.Log().Debug("backup state cleanup starting")
 		// Determine correct post-backup state and atomically apply all changes
 		actualState := s.determineActualServerState()
 		backingUp := false
@@ -132,6 +133,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		} else {
 			s.Log().WithField("new_state", actualState).Info("reset server state after backup completion")
 		}
+		s.Log().Debug("backup state cleanup completed")
 	}()
 	ignored := b.Ignored()
 	if b.Ignored() == "" {
@@ -419,6 +421,21 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 // This is the primary restore function that should be used for all restore operations.
 func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupInterface, reader io.ReadCloser) (err error) {
 	s.Config().SetSuspended(true)
+	
+	// CRITICAL: Reset server state after restore completion - MUST BE FIRST DEFER
+	defer func() {
+		s.Log().Debug("restore state cleanup starting")
+		// Determine correct post-restore state and atomically apply all changes
+		actualState := s.determineActualServerState()
+		restoring := false
+		s.ApplyAtomicStateTransition(AtomicStateTransition{
+			EnvironmentState: actualState,
+			Restoring:        &restoring,
+		})
+		s.Log().WithField("new_state", actualState).Info("reset server state after restore completion")
+		s.Log().Debug("restore state cleanup completed")
+	}()
+	
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
 	// CRITICAL FIX: Consolidate all cleanup into single defer to prevent race conditions
@@ -433,8 +450,6 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		if rerr := s.client.SendRestorationStatus(s.Context(), b.Identifier(), err == nil); rerr != nil {
 			s.Log().WithField("error", rerr).WithField("backup", b.Identifier()).Error("failed to notify Panel of backup restoration status")
 		}
-		
-		// State management is handled by later defer block for proper ordering
 	}()
 
 	// Don't try to restore the server until we have completely stopped the running
@@ -597,18 +612,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		}
 	}
 
-	// CRITICAL: Reset server state after restore completion
-	// ATOMIC: Ensure proper cleanup with atomic state transition
-	defer func() {
-		// Determine correct post-restore state and atomically apply all changes
-		actualState := s.determineActualServerState()
-		restoring := false
-		s.ApplyAtomicStateTransition(AtomicStateTransition{
-			EnvironmentState: actualState,
-			Restoring:        &restoring,
-		})
-		s.Log().WithField("new_state", actualState).Info("reset server state after restore completion")
-	}()
+	// State reset is now handled by first defer block for proper execution order
 
 	// Send final progress update
 	progressTracker.SendFinalProgress(err == nil)
