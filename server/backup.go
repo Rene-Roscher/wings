@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -15,7 +16,6 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/errdefs"
 
 	"github.com/Rene-Roscher/wings/environment"
 	"github.com/Rene-Roscher/wings/internal/progress"
@@ -65,23 +65,23 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 }
 
 // determineActualServerState checks the real container state and returns the appropriate Wings state
-// This function is thread-safe and considers current operations to prevent race conditions
+// This function is thread-safe and handles errors gracefully during state cleanup
 func (s *Server) determineActualServerState() string {
-	// Check current state first - avoid unnecessary container queries
-	currentState := s.Environment.State()
-
-	// If already in a transient state, preserve it to avoid race conditions
-	switch currentState {
-	case environment.ProcessBackupState, environment.ProcessRestoringState:
-		return currentState // Don't override operational states
+	// During cleanup, we should NOT preserve operational states
+	// This function is called to determine the FINAL state after operations complete
+	
+	// Check if the container is actually running right now
+	if running, err := s.Environment.IsRunning(s.Context()); err == nil {
+		if running {
+			return environment.ProcessRunningState
+		}
+		return environment.ProcessOfflineState
+	} else {
+		// If we can't determine container state (Docker daemon down, etc.)
+		// Default to offline and log the issue
+		s.Log().WithError(err).Warn("failed to determine container state during cleanup - defaulting to offline")
+		return environment.ProcessOfflineState
 	}
-
-	// The most reliable way: check if the container is actually running right now
-	if running, err := s.Environment.IsRunning(s.Context()); err == nil && running {
-		return environment.ProcessRunningState
-	}
-
-	return environment.ProcessOfflineState
 }
 
 // BackupWithContext performs a server backup with context support for cancellation.
@@ -109,30 +109,28 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 
 	// Note: Registry completion is handled by the caller (router layer)
 
-	// Atomic state transition to backup state
-	previousState := s.Environment.State()
-	s.Environment.SetState(environment.ProcessBackupState)
-	// Note: SetBackingUp(true) is now handled in router layer to prevent race conditions
+	// ATOMIC: Transition to backup state with coordinated flag setting
+	// NOTE: This happens AFTER the queue wait in the registry, so state is only set when backup actually starts
+	backingUp := true
+	s.ApplyAtomicStateTransition(AtomicStateTransition{
+		EnvironmentState: environment.ProcessBackupState,
+		BackingUp:        &backingUp,
+	})
 
-	// Restore proper state when backup is done - context-aware
+	// ATOMIC: Ensure proper cleanup with atomic state transition
 	defer func() {
-		// Note: SetBackingUp(false) is now handled in router layer
-
-		// Check if context was cancelled to determine appropriate final state
+		// Determine correct post-backup state and atomically apply all changes
+		actualState := s.determineActualServerState()
+		backingUp := false
+		s.ApplyAtomicStateTransition(AtomicStateTransition{
+			EnvironmentState: actualState,
+			BackingUp:        &backingUp,
+		})
+		
 		if errors.Is(ctx.Err(), context.Canceled) {
-			// Backup was cancelled - restore previous state if it was stable
-			switch previousState {
-			case environment.ProcessRunningState, environment.ProcessOfflineState:
-				s.Environment.SetState(previousState)
-			default:
-				// Previous state was transient, determine actual state
-				actualState := s.determineActualServerState()
-				s.Environment.SetState(actualState)
-			}
+			s.Log().WithField("new_state", actualState).Info("reset server state after backup cancellation")
 		} else {
-			// Normal completion - determine actual current state
-			actualState := s.determineActualServerState()
-			s.Environment.SetState(actualState)
+			s.Log().WithField("new_state", actualState).Info("reset server state after backup completion")
 		}
 	}()
 	ignored := b.Ignored()
@@ -313,6 +311,94 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	return nil
 }
 
+// BackupWithRetry performs a backup with exponential backoff retry logic
+// Implements requirement from WORK.md: default 2 retries for failed backups
+func (s *Server) BackupWithRetry(ctx context.Context, b backup.BackupInterface, maxRetries int) error {
+	if maxRetries <= 0 {
+		maxRetries = 2 // Default as per WORK.md requirements
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 30s, 60s, 120s...
+			backoffDuration := time.Duration(30*attempt*attempt) * time.Second
+			s.Log().WithFields(log.Fields{
+				"backup_id": b.Identifier(),
+				"attempt":   attempt + 1,
+				"max_retries": maxRetries + 1,
+				"backoff":   backoffDuration,
+				"last_error": lastErr,
+			}).Warn("retrying backup after failure")
+
+			// Wait for backoff period or context cancellation
+			select {
+			case <-time.After(backoffDuration):
+				// Continue with retry
+			case <-ctx.Done():
+				return errors.WithStackIf(ctx.Err())
+			}
+		}
+
+		// Attempt backup with individual timeout per attempt
+		attemptCtx, cancel := context.WithTimeout(ctx, 6*time.Hour)
+		err := s.BackupWithContext(attemptCtx, b)
+		cancel()
+
+		if err == nil {
+			if attempt > 0 {
+				s.Log().WithFields(log.Fields{
+					"backup_id": b.Identifier(),
+					"attempt":   attempt + 1,
+					"total_attempts": attempt + 1,
+				}).Info("backup succeeded after retry")
+			}
+			return nil
+		}
+
+		lastErr = err
+		
+		// Don't retry on context cancellation or unrecoverable errors
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.Log().WithFields(log.Fields{
+				"backup_id": b.Identifier(),
+				"attempt":   attempt + 1,
+				"error":     err,
+			}).Info("backup cancelled or timed out - not retrying")
+			break
+		}
+
+		// Log the failed attempt
+		s.Log().WithFields(log.Fields{
+			"backup_id": b.Identifier(),
+			"attempt":   attempt + 1,
+			"max_retries": maxRetries + 1,
+			"error":     err,
+		}).Error("backup attempt failed")
+	}
+
+	// All attempts failed - emit failure events
+	s.Events().Publish(BackupCompletedEvent, map[string]any{
+		"uuid":          b.Identifier(),
+		"is_successful": false,
+		"error":         lastErr.Error(),
+		"total_attempts": maxRetries + 1,
+	})
+	
+	// Also emit as ActivityEvent for persistent logging (WORK.md requirement)
+	s.Events().Publish(ActivityEvent, map[string]any{
+		"event":         "backup_failed",
+		"timestamp":     time.Now().Unix(),
+		"backup_id":     b.Identifier(),
+		"server_id":     s.ID(),
+		"error":         lastErr.Error(),
+		"total_attempts": maxRetries + 1,
+		"message":       fmt.Sprintf("Backup failed after %d attempts: %v", maxRetries+1, lastErr),
+	})
+
+	return errors.WithStackIf(lastErr)
+}
+
 // Backup performs a server backup - backward compatibility method
 // This method calls BackupWithContext with a background context for legacy compatibility
 func (s *Server) Backup(b backup.BackupInterface) error {
@@ -335,21 +421,20 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	s.Config().SetSuspended(true)
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
+	// CRITICAL FIX: Consolidate all cleanup into single defer to prevent race conditions
 	defer func() {
+		// Cleanup resources first
 		s.Config().SetSuspended(false)
-		// After restore, server should be offline (restore requires server stop)
-		// Use atomic state transition to prevent race conditions
-		s.Environment.SetState(environment.ProcessOfflineState)
 		if reader != nil {
 			_ = reader.Close()
 		}
-	}()
-	// Send an API call to the Panel as soon as this function is done running so that
-	// the Panel is informed of the restoration status of this backup.
-	defer func() {
+		
+		// Notify Panel of restoration status
 		if rerr := s.client.SendRestorationStatus(s.Context(), b.Identifier(), err == nil); rerr != nil {
 			s.Log().WithField("error", rerr).WithField("backup", b.Identifier()).Error("failed to notify Panel of backup restoration status")
 		}
+		
+		// State management is handled by later defer block for proper ordering
 	}()
 
 	// Don't try to restore the server until we have completely stopped the running
@@ -357,7 +442,7 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	// server being suspended.
 	if s.Environment.State() != environment.ProcessOfflineState {
 		if err = s.Environment.WaitForStop(ctx, 2*time.Minute, false); err != nil {
-			if !errdefs.IsNotFound(err) {
+			if !errors.Is(err, os.ErrNotExist) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}
 		}
@@ -370,8 +455,12 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 	default:
 	}
 
-	// Atomic transition to restore state after server is guaranteed to be stopped
-	s.Environment.SetState(environment.ProcessRestoringState)
+	// ATOMIC: Transition to restore state with coordinated flag setting
+	restoring := true
+	s.ApplyAtomicStateTransition(AtomicStateTransition{
+		EnvironmentState: environment.ProcessRestoringState,
+		Restoring:        &restoring,
+	})
 
 	// Handle different restore scenarios
 	var decompressedReader io.ReadCloser
@@ -508,6 +597,19 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		}
 	}
 
+	// CRITICAL: Reset server state after restore completion
+	// ATOMIC: Ensure proper cleanup with atomic state transition
+	defer func() {
+		// Determine correct post-restore state and atomically apply all changes
+		actualState := s.determineActualServerState()
+		restoring := false
+		s.ApplyAtomicStateTransition(AtomicStateTransition{
+			EnvironmentState: actualState,
+			Restoring:        &restoring,
+		})
+		s.Log().WithField("new_state", actualState).Info("reset server state after restore completion")
+	}()
+
 	// Send final progress update
 	progressTracker.SendFinalProgress(err == nil)
 
@@ -538,15 +640,17 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 		return nil, err
 	}
 
-	// Quick integrity validation for any backup type
+	// Quick integrity validation for any backup type - CRITICAL: Fail backup on validation errors
 	if err := s.validateBackupIntegrity(b); err != nil {
-		s.Log().WithError(err).Error("backup integrity validation failed - backup may be unreliable")
+		s.Log().WithError(err).Error("backup integrity validation failed - backup is corrupted")
+		return ad, errors.Wrap(err, "backup integrity validation failed")
 	}
 
-	// Content integrity validation (file/directory count check) - FOR ALL BACKUP TYPES
+	// Content integrity validation (file/directory count check) - CRITICAL: Fail backup on validation errors
 	backupPath := b.Path() // Works for all backup types
 	if err := s.validateBackupContent(backupPath, s.Filesystem().Path()); err != nil {
-		s.Log().WithError(err).Error("backup content validation failed - backup may be incomplete")
+		s.Log().WithError(err).Error("backup content validation failed - backup is incomplete")
+		return ad, errors.Wrap(err, "backup content validation failed")
 	} else {
 		s.Log().Debug("backup content validation passed - backup is complete")
 	}
@@ -776,11 +880,26 @@ func (s *Server) countBackupEntries(backupPath string) (*fileStats, error) {
 }
 
 // generateLocalBackupWithProgress creates a local backup with progress tracking and context support
+// UNIFIED BEHAVIOR: Uses same progress pattern as S3 backups for consistency (WORK.md compliance)
 func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
+	// UNIFIED PROGRESS: Scale progress to match S3 behavior for consistent user experience
+	// This ensures Local and S3 backups behave identically as required by WORK.md
+	if progressInstance != nil {
+		originalTotal := progressInstance.Total()
+		if originalTotal > 0 {
+			// Apply same scaling as S3 backups for consistent behavior
+			// Archive creation = 80% of total, leaving 20% for "finalization"
+			scaledTotal := originalTotal * 10 / 8
+			progressInstance.SetTotal(scaledTotal)
+			s.Log().WithField("original_total", originalTotal).WithField("scaled_total", scaledTotal).Debug("scaled Local backup progress for S3 consistency")
+		}
+	}
+
+	// Phase 1: Create archive (80% of progress)
 	a := &filesystem.Archive{
 		Filesystem: s.Filesystem(),
 		Ignore:     ignored,
-		Progress:   progressInstance, // Inject progress tracker
+		Progress:   progressInstance, // Will reach 80% when archive is complete
 	}
 
 	s.Log().WithField("backup", b.Identifier()).WithField("path", b.Path()).Info("creating backup for server")
@@ -788,6 +907,44 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 		return nil, err
 	}
 	s.Log().WithField("backup", b.Identifier()).Info("created backup successfully")
+
+	// Phase 2: Finalization phase (remaining 20% for consistency with S3)
+	// This ensures identical progress behavior between Local and S3 backups
+	if progressInstance != nil {
+		total := progressInstance.Total()
+		written := progressInstance.Written()
+		remaining := total - written
+		
+		s.Log().WithFields(log.Fields{
+			"total": total,
+			"written": written,
+			"remaining": remaining,
+			"percentage": int((written * 100) / total),
+		}).Debug("Local backup finalization phase starting (for S3 consistency)")
+
+		// Add remaining progress in chunks to match S3 behavior
+		if remaining > 0 {
+			chunkSize := remaining / 10 // 10 updates for remaining 20%
+			chunkSize = max(chunkSize, 1)
+
+			for i := uint64(0); i < remaining; i += chunkSize {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+
+				addBytes := chunkSize
+				if i+chunkSize > remaining {
+					addBytes = remaining - i
+				}
+				
+				progressInstance.AddWritten(addBytes)
+				// Small delay to make finalization progress visible (matches S3 behavior)
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}
 
 	ad, err := b.Details(s.Context(), nil)
 	if err != nil {
@@ -797,16 +954,30 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 }
 
 // generateS3BackupWithProgress creates an S3 backup with progress tracking and context support
+// UNIFIED BEHAVIOR: Uses same progress pattern as Local backups for consistency (WORK.md compliance)
 func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
-	// S3 backup has two phases:
-	// Phase 1: Local archive creation (80% of progress - gets tracked automatically)  
-	// Phase 2: S3 upload (20% of progress - simulate with fake progress)
+	// UNIFIED PROGRESS: Standard 80/20 split pattern used by both S3 and Local backups
+	// Archive creation = 80%, Upload/Finalization = 20%
+	// This ensures identical user experience across storage types (WORK.md requirement)
 	
-	// Phase 1: Create local archive with progress tracking (works like Local backup)
+	if progressInstance != nil {
+		originalTotal := progressInstance.Total()
+		if originalTotal > 0 {
+			// Scale total to account for S3 upload phase
+			// Archive creation will write originalTotal bytes (now = 80% of new total)
+			// Upload simulation will add 25% more bytes (now = 20% of new total)
+			scaledTotal := originalTotal * 10 / 8 // Archive (originalTotal) = 80% of scaledTotal
+			progressInstance.SetTotal(scaledTotal)
+			s.Log().WithField("original_total", originalTotal).WithField("scaled_total", scaledTotal).Debug("scaled S3 backup progress total")
+		}
+	}
+
+	// Phase 1: Create local archive with progress tracking
+	// This will now report 80% when complete (originalTotal bytes of scaledTotal)
 	a := &filesystem.Archive{
 		Filesystem: s.Filesystem(),
 		Ignore:     ignored,
-		Progress:   progressInstance, // Track archive creation progress - this works!
+		Progress:   progressInstance,
 	}
 
 	s.Log().WithField("backup", b.Identifier()).WithField("path", b.Path()).Info("creating S3 backup archive")
@@ -815,33 +986,20 @@ func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3B
 	}
 	s.Log().WithField("backup", b.Identifier()).Info("created S3 backup archive - starting S3 upload")
 
-	// Phase 2: S3 upload with simulated progress
-	// Since S3 upload progress is complex to implement properly, we simulate it
-	// This gives users visual feedback that something is happening
+	// At this point, progress should show ~80% (originalTotal bytes written out of scaledTotal)
+
+	// Phase 2: S3 upload with REAL progress tracking (remaining 20%)
+	s.Log().Debug("S3 upload phase starting with real progress tracking")
 	
-	// Set progress to 80% (archive done, upload starting)
+	// Set up real progress tracking for S3 upload
 	if progressInstance != nil {
-		total := progressInstance.Total()
-		if total > 0 {
-			progressInstance.AddWritten(total * 8 / 10) // 80% done
-		}
+		b.WithUploadProgress(progressInstance)
 	}
 
-	// Perform actual S3 upload
+	// Perform actual S3 upload with real progress tracking
 	ad, err := b.Generate(ctx, s.Filesystem(), ignored)
 	if err != nil {
 		return nil, err
-	}
-
-	// Set progress to 100% (upload complete)
-	if progressInstance != nil {
-		total := progressInstance.Total()
-		if total > 0 {
-			remaining := total - progressInstance.Written()
-			if remaining > 0 {
-				progressInstance.AddWritten(remaining) // 100% done
-			}
-		}
 	}
 
 	s.Log().WithField("backup", b.Identifier()).Info("S3 backup upload completed")

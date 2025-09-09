@@ -39,28 +39,73 @@ type BackupOperation struct {
 }
 
 // BackupOperationRegistry tracks running backup and restore operations
-// allowing them to be cancelled via API calls
+// allowing them to be cancelled via API calls with concurrency limits and queuing
 type BackupOperationRegistry struct {
 	mu         sync.RWMutex
 	operations map[string]*BackupOperation
 	logger     *log.Entry
+	// CRITICAL: Operation limits to prevent resource exhaustion with queuing support
+	maxConcurrentBackups  int
+	maxConcurrentRestores int
+	// QUEUING: Semaphores to handle waiting instead of immediate rejection  
+	backupSemaphore  chan struct{}
+	restoreSemaphore chan struct{}
 }
 
-// NewBackupOperationRegistry creates a new operation registry
+// NewBackupOperationRegistry creates a new operation registry with resource limits and queuing
 func NewBackupOperationRegistry() *BackupOperationRegistry {
+	maxBackups := 8
+	maxRestores := 8
+	
 	return &BackupOperationRegistry{
 		operations: make(map[string]*BackupOperation),
 		logger:     log.WithField("component", "backup_registry"),
+		// UPDATED: Higher limits as requested - 8 concurrent backups and 8 restores
+		maxConcurrentBackups:  maxBackups,
+		maxConcurrentRestores: maxRestores,
+		// QUEUING: Semaphore channels for controlled concurrency with waiting
+		backupSemaphore:  make(chan struct{}, maxBackups),
+		restoreSemaphore: make(chan struct{}, maxRestores),
 	}
 }
 
-// Register registers a new backup operation for tracking and cancellation
-func (r *BackupOperationRegistry) Register(backupID, serverID string, opType OperationType) (*BackupOperation, context.Context, context.CancelFunc) {
+// Register registers a new backup operation for tracking and cancellation with queuing
+// CRITICAL: Now accepts parent context and uses semaphore queuing instead of immediate rejection
+// Returns: operation, context, cancelFunc, error, wasQueued
+func (r *BackupOperationRegistry) Register(parentCtx context.Context, backupID, serverID string, opType OperationType) (*BackupOperation, context.Context, context.CancelFunc, error, bool) {
+	// QUEUING: Acquire semaphore slot - will wait if limit reached
+	var semaphore chan struct{}
+	switch opType {
+	case OperationTypeBackup:
+		semaphore = r.backupSemaphore
+	case OperationTypeRestore:
+		semaphore = r.restoreSemaphore
+	default:
+		return nil, nil, nil, errors.New("invalid operation type"), false
+	}
+
+	// ATOMIC: Check if we need to wait (for accurate state reporting)
+	needsQueue := len(semaphore) >= cap(semaphore)
+	
+	// WAIT in queue until slot available or context cancelled
+	select {
+	case semaphore <- struct{}{}: // Successfully acquired slot
+		r.logger.WithFields(log.Fields{
+			"backup_id": backupID,
+			"type":      opType,
+			"was_queued": needsQueue,
+		}).Debug("acquired operation slot from queue")
+	case <-parentCtx.Done():
+		return nil, nil, nil, errors.Wrap(parentCtx.Err(), "cancelled while waiting in operation queue"), needsQueue
+	}
+
+	// Now proceed with registration
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	operationID := uuid.New().String()
-	ctx, cancel := context.WithCancel(context.Background())
+	// CRITICAL: Use parent context to ensure cancellation propagation
+	ctx, cancel := context.WithCancel(parentCtx)
 
 	operation := &BackupOperation{
 		ID:        operationID,
@@ -89,9 +134,10 @@ func (r *BackupOperationRegistry) Register(backupID, serverID string, opType Ope
 		"backup_id":    backupID,
 		"server_id":    serverID,
 		"type":         opType,
+		"total_ops":    len(r.operations),
 	}).Info("registered backup operation")
 
-	return operation, ctx, cancel
+	return operation, ctx, cancel, nil, needsQueue
 }
 
 // Cancel cancels a backup operation by backup ID
@@ -113,6 +159,24 @@ func (r *BackupOperationRegistry) Cancel(backupID string) error {
 
 	// Cancel the context
 	operation.Cancel()
+
+	// QUEUING: Release semaphore slot when cancelled - NON-BLOCKING safe pattern
+	switch operation.Type {
+	case OperationTypeBackup:
+		select {
+		case <-r.backupSemaphore:
+			r.logger.Debug("released backup semaphore slot after cancellation")
+		default:
+			r.logger.Debug("backup semaphore already drained - normal during high concurrency")
+		}
+	case OperationTypeRestore:
+		select {
+		case <-r.restoreSemaphore:
+			r.logger.Debug("released restore semaphore slot after cancellation")
+		default:
+			r.logger.Debug("restore semaphore already drained - normal during high concurrency")
+		}
+	}
 
 	// Remove from registry
 	delete(r.operations, backupID)
@@ -144,7 +208,7 @@ func (r *BackupOperationRegistry) List(serverID string) []*BackupOperation {
 	return operations
 }
 
-// Complete removes a completed operation from the registry
+// Complete removes a completed operation from the registry and releases semaphore slot
 func (r *BackupOperationRegistry) Complete(backupID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -157,6 +221,24 @@ func (r *BackupOperationRegistry) Complete(backupID string) {
 			"type":         operation.Type,
 		}).Info("backup operation completed")
 
+		// QUEUING: Release semaphore slot so next operation can proceed - NON-BLOCKING safe pattern
+		switch operation.Type {
+		case OperationTypeBackup:
+			select {
+			case <-r.backupSemaphore:
+				r.logger.Debug("released backup semaphore slot")
+			default:
+				r.logger.Debug("backup semaphore already drained - normal during high concurrency")
+			}
+		case OperationTypeRestore:
+			select {
+			case <-r.restoreSemaphore:
+				r.logger.Debug("released restore semaphore slot")
+			default:
+				r.logger.Debug("restore semaphore already drained - normal during high concurrency")
+			}
+		}
+
 		delete(r.operations, backupID)
 	}
 }
@@ -166,6 +248,39 @@ func (r *BackupOperationRegistry) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.operations)
+}
+
+// GetQueueStatus returns detailed queue status for monitoring
+func (r *BackupOperationRegistry) GetQueueStatus() map[string]any {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	
+	backupCount := 0
+	restoreCount := 0
+	for _, op := range r.operations {
+		switch op.Type {
+		case OperationTypeBackup:
+			backupCount++
+		case OperationTypeRestore:
+			restoreCount++
+		}
+	}
+	
+	return map[string]any{
+		"backups": map[string]any{
+			"active":    backupCount,
+			"max":       r.maxConcurrentBackups,
+			"available": r.maxConcurrentBackups - backupCount,
+			"queue_length": len(r.backupSemaphore),
+		},
+		"restores": map[string]any{
+			"active":    restoreCount,
+			"max":       r.maxConcurrentRestores,
+			"available": r.maxConcurrentRestores - restoreCount,
+			"queue_length": len(r.restoreSemaphore),
+		},
+		"total_operations": len(r.operations),
+	}
 }
 
 // CountForServer returns the number of running operations for a specific server
@@ -202,6 +317,25 @@ func (r *BackupOperationRegistry) CleanupStaleOperations(maxDuration time.Durati
 
 			// Cancel the stale operation
 			operation.Cancel()
+			
+			// CRITICAL: Release semaphore slot to prevent leaks during cleanup - NON-BLOCKING safe pattern
+			switch operation.Type {
+			case OperationTypeBackup:
+				select {
+				case <-r.backupSemaphore:
+					r.logger.Debug("released backup semaphore slot during cleanup")
+				default:
+					r.logger.Debug("backup semaphore already drained - normal during cleanup")
+				}
+			case OperationTypeRestore:
+				select {
+				case <-r.restoreSemaphore:
+					r.logger.Debug("released restore semaphore slot during cleanup")
+				default:
+					r.logger.Debug("restore semaphore already drained - normal during cleanup")
+				}
+			}
+			
 			delete(r.operations, backupID)
 		}
 	}
@@ -213,6 +347,61 @@ var backupOperationRegistry = NewBackupOperationRegistry()
 // GetBackupOperationRegistry returns the global backup operation registry
 func GetBackupOperationRegistry() *BackupOperationRegistry {
 	return backupOperationRegistry
+}
+
+// CancelAllForServer cancels all running backup operations for a specific server
+// This is used during server deletion to ensure proper cleanup
+func (r *BackupOperationRegistry) CancelAllForServer(serverID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var cancelledOps []string
+	
+	for backupID, operation := range r.operations {
+		if operation.ServerID == serverID {
+			r.logger.WithFields(log.Fields{
+				"operation_id": operation.ID,
+				"backup_id":    backupID,
+				"server_id":    serverID,
+				"type":         operation.Type,
+			}).Info("cancelling backup operation for server deletion")
+
+			// Cancel the context
+			operation.Cancel()
+			
+			// CRITICAL: Release semaphore slot to prevent leaks during server deletion - NON-BLOCKING safe pattern
+			switch operation.Type {
+			case OperationTypeBackup:
+				select {
+				case <-r.backupSemaphore:
+					r.logger.Debug("released backup semaphore slot for server deletion")
+				default:
+					r.logger.Debug("backup semaphore already drained - normal during server deletion")
+				}
+			case OperationTypeRestore:
+				select {
+				case <-r.restoreSemaphore:
+					r.logger.Debug("released restore semaphore slot for server deletion")
+				default:
+					r.logger.Debug("restore semaphore already drained - normal during server deletion")
+				}
+			}
+			
+			// Remove from registry
+			delete(r.operations, backupID)
+			cancelledOps = append(cancelledOps, backupID)
+		}
+	}
+
+	if len(cancelledOps) > 0 {
+		r.logger.WithFields(log.Fields{
+			"server_id":        serverID,
+			"cancelled_count":  len(cancelledOps),
+			"cancelled_ops":    cancelledOps,
+		}).Info("cancelled all backup operations for server deletion")
+	}
+
+	return nil
 }
 
 // StartBackupOperationCleanup starts a background goroutine that periodically cleans up stale operations

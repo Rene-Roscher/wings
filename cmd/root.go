@@ -308,6 +308,12 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		log.WithField("error", err).Error("failed to create archive directory")
 	}
 
+	// CRITICAL: Start backup operation cleanup to prevent resource leaks
+	go func() {
+		log.WithField("subsystem", "backup-registry").Info("starting backup operation cleanup goroutine")
+		server.StartBackupOperationCleanup(cmd.Context())
+	}()
+
 	// Ensure the backup directory exists.
 	if err := os.MkdirAll(sys.BackupDirectory, 0o755); err != nil {
 		log.WithField("error", err).Error("failed to create backup directory")

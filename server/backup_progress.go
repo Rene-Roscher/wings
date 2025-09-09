@@ -79,8 +79,8 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		}
 	}
 
-	// ALWAYS send initial progress (0%) and final progress (100%) regardless of throttling
-	isFinalProgress := total > 0 && percentage >= 100
+	// ALWAYS send initial progress (0%) and final progress (100%) - but only ONCE!
+	isFinalProgress := total > 0 && percentage >= 100 && atomic.LoadInt64(&spt.lastSent) < 100
 	
 	if shouldSend || isFinalProgress {
 		atomic.StoreInt64(&spt.lastTime, now)
@@ -159,6 +159,7 @@ func NewSimpleProgressTracker(ctx context.Context, server *Server, backupID, bac
 func (spt *SimpleProgressTracker) Close() {
 	if spt.cancel != nil {
 		spt.cancel()
+		spt.cancel = nil // Prevent double-cancel
 	}
 	spt.wg.Wait() // Wait for all goroutines to finish
 }
@@ -212,9 +213,24 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		spt.server.Events().Publish(BackupProgressEvent, update)
 	}()
 	
-	// Close after final progress
+	// Close after final progress with managed goroutine
+	spt.wg.Add(1)
 	go func() {
-		time.Sleep(100 * time.Millisecond) // Allow final progress to send
-		spt.Close()
+		defer spt.wg.Done()
+		defer func() {
+			recover() // Silent recovery
+		}()
+		
+		// Use context-aware sleep instead of time.Sleep
+		timer := time.NewTimer(100 * time.Millisecond)
+		defer timer.Stop()
+		
+		select {
+		case <-timer.C:
+			spt.Close()
+		case <-spt.ctx.Done():
+			spt.Close() // Still close even if context cancelled
+			return
+		}
 	}()
 }

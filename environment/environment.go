@@ -22,6 +22,9 @@ const (
 	ProcessStoppingState  = "stopping"
 	ProcessBackupState    = "backup"
 	ProcessRestoringState = "restore"
+	// NEW: Queue states to show when operations are waiting
+	ProcessBackupQueuedState  = "backup_queued"
+	ProcessRestoreQueuedState = "restore_queued"
 )
 
 // Defines the basic interface that all environments need to implement so that

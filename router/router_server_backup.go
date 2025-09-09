@@ -4,59 +4,20 @@ import (
 	"context"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 
+	"github.com/Rene-Roscher/wings/environment"
 	"github.com/Rene-Roscher/wings/router/middleware"
 	"github.com/Rene-Roscher/wings/server"
 	"github.com/Rene-Roscher/wings/server/backup"
 )
 
-// isValidBackupContentType validates if the given content type is supported for backup restoration
-// Supports GZIP, ZSTD, TAR, and generic application types that may contain backup data
-func isValidBackupContentType(contentType string) bool {
-	// Remove any charset or boundary parameters
-	ctBase := strings.Split(contentType, ";")[0]
-	ctBase = strings.TrimSpace(strings.ToLower(ctBase))
-	
-	// List of acceptable content types for backup files
-	validTypes := []string{
-		// GZIP formats
-		"application/x-gzip",
-		"application/gzip",
-		"application/x-compressed",
-		"application/x-gtar",
-		
-		// ZSTD formats  
-		"application/x-zstd",
-		"application/zstd",
-		"application/x-zstandard", 
-		
-		// TAR formats
-		"application/x-tar",
-		"application/tar",
-		
-		// Generic/fallback types (some S3 providers use these)
-		"application/octet-stream",
-		"binary/octet-stream",
-		
-		// Backup-specific types
-		"application/x-compressed-tar",
-		"application/x-tgz",
-	}
-	
-	for _, validType := range validTypes {
-		if ctBase == validType {
-			return true
-		}
-	}
-	
-	return false
-}
+// isValidBackupContentType is now replaced by backup.IsValidBackupContentType
+// which uses the extensible CompressionRegistry for better format support
 
 // postServerBackup performs a backup against a given server instance using the
 // provided backup adapter.
@@ -75,6 +36,12 @@ func postServerBackup(c *gin.Context) {
 	if s.IsRestoring() {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"error": "A restore operation is already running for this server",
+		})
+		return
+	}
+	if s.IsTransferring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A transfer operation is already running for this server",
 		})
 		return
 	}
@@ -105,20 +72,36 @@ func postServerBackup(c *gin.Context) {
 		"request_id": c.GetString("request_id"),
 	})
 
-	// Set backup state BEFORE starting goroutine to prevent race conditions
-	s.SetBackingUp(true)
+	// Note: SetBackingUp is now handled atomically within the backup function
 
 	go func(b backup.BackupInterface, s *server.Server, logger *log.Entry) {
 		// Ensure backup state is always reset, even on panic
 		defer func() {
 			if r := recover(); r != nil {
 				logger.WithField("panic", r).Error("backup operation panicked")
+				// Only reset backup flag on panic - normal completion is handled in Backup()
+				s.SetBackingUp(false)
 			}
-			s.SetBackingUp(false)
 		}()
-		// Register operation for cancellation support
+		// ATOMIC REGISTRATION: Register and get accurate queue status
 		registry := server.GetBackupOperationRegistry()
-		_, ctx, cancel := registry.Register(data.Uuid, s.ID(), server.OperationTypeBackup)
+		logger.Info("registering backup operation in queue system")
+		
+		// ATOMIC: Register operation and get queue status atomically
+		_, ctx, cancel, err, wasQueued := registry.Register(s.Context(), data.Uuid, s.ID(), server.OperationTypeBackup)
+		if err != nil {
+			logger.WithError(err).Error("failed to register backup operation")
+			s.Events().Publish(server.DaemonMessageEvent, "Failed to register backup: " + err.Error())
+			return
+		}
+		
+		// ACCURATE STATE MANAGEMENT: Set state based on actual queue experience
+		if wasQueued {
+			s.Environment.SetState(environment.ProcessBackupQueuedState)
+			s.Events().Publish(server.DaemonMessageEvent, "Backup was queued and slot acquired - starting backup process...")
+		} else {
+			s.Events().Publish(server.DaemonMessageEvent, "Backup slot available - starting backup process immediately...")
+		}
 		// Defer cleanup - will run AFTER backup completes
 		defer func() {
 			registry.Complete(data.Uuid)
@@ -129,8 +112,8 @@ func postServerBackup(c *gin.Context) {
 		ctx, timeoutCancel := context.WithTimeout(ctx, 6*time.Hour)
 		defer timeoutCancel()
 
-		if err := s.BackupWithContext(ctx, b); err != nil {
-			logger.WithField("error", errors.WithStackIf(err)).Error("router: failed to generate server backup")
+		if err := s.BackupWithRetry(ctx, b, 2); err != nil {
+			logger.WithField("error", errors.WithStackIf(err)).Error("router: failed to generate server backup after retries")
 		}
 	}(adapter, s, logger)
 
@@ -164,6 +147,12 @@ func postServerRestoreBackup(c *gin.Context) {
 		})
 		return
 	}
+	if s.IsTransferring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A transfer operation is already running for this server",
+		})
+		return
+	}
 
 	var data struct {
 		Adapter           backup.AdapterType `binding:"required,oneof=wings s3" json:"adapter"`
@@ -180,13 +169,8 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 
-	s.SetRestoring(true)
-	hasError := true
-	defer func() {
-		if hasError {
-			s.SetRestoring(false)
-		}
-	}()
+	// State management is now handled atomically within the restore function
+	// to prevent race conditions with the operation registry
 
 	logger.Info("processing server backup restore request")
 	if data.TruncateDirectory {
@@ -206,16 +190,32 @@ func postServerRestoreBackup(c *gin.Context) {
 			return
 		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
-			// Register restore operation for cancellation support
+			// ATOMIC REGISTRATION: Register and get accurate queue status
 			registry := server.GetBackupOperationRegistry()
-			_, ctx, cancel := registry.Register(c.Param("backup"), s.ID(), server.OperationTypeRestore)
+			logger.Info("registering local restore operation in queue system")
+			
+			// ATOMIC: Register operation and get queue status atomically
+			_, ctx, cancel, err, wasQueued := registry.Register(s.Context(), c.Param("backup"), s.ID(), server.OperationTypeRestore)
+			if err != nil {
+				logger.WithError(err).Error("failed to register restore operation")
+				s.Events().Publish(server.DaemonMessageEvent, "Failed to register restore: " + err.Error())
+				return
+			}
+			
+			// ACCURATE STATE MANAGEMENT: Set state based on actual queue experience
+			if wasQueued {
+				s.Environment.SetState(environment.ProcessRestoreQueuedState)
+				s.Events().Publish(server.DaemonMessageEvent, "Restore was queued and slot acquired - starting restore process...")
+			} else {
+				s.Events().Publish(server.DaemonMessageEvent, "Restore slot available - starting restore process immediately...")
+			}
 			defer func() {
 				if r := recover(); r != nil {
 					logger.WithField("panic", r).Error("restore operation panicked")
 				}
 				registry.Complete(c.Param("backup"))
 				cancel() // Cancel AFTER marking complete
-				s.SetRestoring(false) // Ensure restoring state is always reset
+				// Note: SetRestoring is now handled atomically within the restore function
 			}()
 
 			// Add 4-hour timeout for restore operations
@@ -225,20 +225,34 @@ func postServerRestoreBackup(c *gin.Context) {
 			logger.Info("starting restoration process for server backup using local driver")
 			if err := s.RestoreBackupWithContext(ctx, b, nil); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
+				s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from local backup: " + err.Error())
+				s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
+					"successful": false,
+					"error": err.Error(),
+				})
+			} else {
+				s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
+				s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
+					"successful": true,
+				})
+				logger.Info("completed server restoration from local backup")
 			}
-			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
-			s.Events().Publish(server.BackupRestoreCompletedEvent, "")
-			logger.Info("completed server restoration from local backup")
 		}(s, b, logger)
-		hasError = false
+		// State cleanup handled atomically by restore operation
 		c.Status(http.StatusAccepted)
 		return
 	}
 
 	// Since this is not a local backup we need to stream the archive and then
 	// parse over the contents as we go in order to restore it to the server.
-	httpClient := http.Client{
+	httpClient := &http.Client{
 		Timeout: time.Hour * 2, // 2 hour timeout for large backup downloads
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			DisableKeepAlives:   false,
+			DisableCompression:  true, // Backup files are already compressed
+		},
 	}
 	logger.Info("downloading backup from remote location...")
 	// Use proper timeout to prevent indefinite hangs during backup downloads.
@@ -254,32 +268,62 @@ func postServerRestoreBackup(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	// Validate content types for supported backup formats
+	
+	// CRITICAL: Ensure response body is always closed in error paths before goroutine takes ownership
+	var goroutineStarted bool
+	defer func() {
+		// Only close if goroutine hasn't taken ownership of the response
+		if !goroutineStarted && res != nil && res.Body != nil {
+			if err := res.Body.Close(); err != nil {
+				logger.WithError(err).Warn("failed to close HTTP response body in error path")
+			}
+		}
+	}()
+	
+	// Validate content types for supported backup formats using extensible compression registry
 	contentType := res.Header.Get("Content-Type")
 	if contentType == "" {
 		// Accept empty content type (some S3 providers don't set it)
-	} else if !isValidBackupContentType(contentType) {
-		_ = res.Body.Close()
+	} else if !backup.IsValidBackupContentType(contentType) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"error": "The provided backup link has an unsupported content type. \"" + contentType + "\" is not a supported backup format (gzip, zstd, or tar).",
 		})
 		return
 	}
+	
+	// Mark that goroutine will take ownership of the response
+	goroutineStarted = true
 
 	go func(s *server.Server, uuid string, logger *log.Entry) {
 		// CRITICAL: Always close response body to prevent resource leak
 		defer res.Body.Close()
 		
-		// Register restore operation for cancellation support
+		// ATOMIC REGISTRATION: Register and get accurate queue status
 		registry := server.GetBackupOperationRegistry()
-		_, ctx, cancel := registry.Register(uuid, s.ID(), server.OperationTypeRestore)
+		logger.Info("registering S3 restore operation in queue system")
+		
+		// ATOMIC: Register operation and get queue status atomically
+		_, ctx, cancel, err, wasQueued := registry.Register(s.Context(), uuid, s.ID(), server.OperationTypeRestore)
+		if err != nil {
+			logger.WithError(err).Error("failed to register S3 restore operation")
+			s.Events().Publish(server.DaemonMessageEvent, "Failed to register S3 restore: " + err.Error())
+			return
+		}
+		
+		// ACCURATE STATE MANAGEMENT: Set state based on actual queue experience
+		if wasQueued {
+			s.Environment.SetState(environment.ProcessRestoreQueuedState)
+			s.Events().Publish(server.DaemonMessageEvent, "S3 restore was queued and slot acquired - starting restore process...")
+		} else {
+			s.Events().Publish(server.DaemonMessageEvent, "S3 restore slot available - starting restore process immediately...")
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				logger.WithField("panic", r).Error("S3 restore operation panicked")
 			}
 			registry.Complete(uuid)
 			cancel() // Cancel AFTER marking complete
-			s.SetRestoring(false) // Ensure restoring state is always reset
+			// Note: SetRestoring is now handled atomically within the restore function
 		}()
 
 		// Add 4-hour timeout for restore operations
@@ -289,41 +333,61 @@ func postServerRestoreBackup(c *gin.Context) {
 		logger.Info("starting restoration process for server backup using S3 driver")
 		if err := s.RestoreBackupWithContext(ctx, backup.NewS3(client, uuid, ""), res.Body); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
+			s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from S3 backup: " + err.Error())
+			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
+				"successful": false,
+				"error": err.Error(),
+			})
+		} else {
+			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
+			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
+				"successful": true,
+			})
+			logger.Info("completed server restoration from S3 backup")
 		}
-		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
-		s.Events().Publish(server.BackupRestoreCompletedEvent, "")
-		logger.Info("completed server restoration from S3 backup")
 	}(s, c.Param("backup"), logger)
 
-	hasError = false
+	// State cleanup handled atomically by restore operation
 	c.Status(http.StatusAccepted)
 }
 
-// deleteServerBackup deletes a local backup of a server. If the backup is not
-// found on the machine just return a 404 error. The service calling this
-// endpoint can make its own decisions as to how it wants to handle that
-// response.
+// deleteServerBackup deletes a backup file of a server. This now supports both Local and S3 backups
+// for consistent behavior (WORK.md compliance). If the backup is not found on the machine just return a 404 error.
 func deleteServerBackup(c *gin.Context) {
-	b, _, err := backup.LocateLocal(middleware.ExtractApiClient(c), c.Param("backup"))
-	if err != nil {
-		// Just return from the function at this point if the backup was not located.
-		if errors.Is(err, os.ErrNotExist) {
-			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
-				"error": "The requested backup was not found on this server.",
-			})
+	client := middleware.ExtractApiClient(c)
+	backupID := c.Param("backup")
+	
+	// UNIFIED BEHAVIOR: Try to locate and delete backup regardless of type (Local or S3)
+	// This ensures consistent deletion behavior between storage types (WORK.md requirement)
+	
+	// First try to locate as Local backup
+	if localBackup, _, err := backup.LocateLocal(client, backupID); err == nil {
+		// Found as Local backup - delete it
+		if err := localBackup.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			middleware.CaptureAndAbort(c, err)
 			return
 		}
-		middleware.CaptureAndAbort(c, err)
+		c.Status(http.StatusNoContent)
 		return
 	}
-	// I'm not entirely sure how likely this is to happen, however if we did manage to
-	// locate the backup previously and it is now missing when we go to delete, just
-	// treat it as having been successful, rather than returning a 404.
-	if err := b.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		middleware.CaptureAndAbort(c, err)
+	
+	// If not found as Local backup, check if it's an S3 backup file that exists locally
+	// S3 backups may leave local files behind after failed uploads or for debugging
+	s3Backup := backup.NewS3(client, backupID, "")
+	if _, err := os.Stat(s3Backup.Path()); err == nil {
+		// Found S3 backup file locally - delete it
+		if err := s3Backup.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
 		return
 	}
-	c.Status(http.StatusNoContent)
+	
+	// If neither Local nor S3 backup file found, return 404
+	c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+		"error": "The requested backup was not found on this server.",
+	})
 }
 
 // cancelServerBackup cancels a running backup operation for a server.

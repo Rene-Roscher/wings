@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"emperror.dev/errors"
@@ -21,19 +22,36 @@ import (
 
 type S3Backup struct {
 	Backup
+	// Progress tracker for upload phase (optional)
+	uploadProgress ProgressTracker
+}
+
+// ProgressTracker interface for S3 upload progress tracking
+// Compatible with internal/progress.Progress
+type ProgressTracker interface {
+	AddWritten(bytes uint64)
+	Total() uint64
+	Written() uint64
 }
 
 var _ BackupInterface = (*S3Backup)(nil)
 
 func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	return &S3Backup{
-		Backup{
+		Backup: Backup{
 			client:  client,
 			Uuid:    uuid,
 			Ignore:  ignore,
 			adapter: S3BackupAdapter,
 		},
+		uploadProgress: nil, // Set via WithUploadProgress method
 	}
+}
+
+// WithUploadProgress sets the progress tracker for S3 upload phase
+func (s *S3Backup) WithUploadProgress(progress ProgressTracker) *S3Backup {
+	s.uploadProgress = progress
+	return s
 }
 
 // Remove removes a backup from the system.
@@ -160,6 +178,10 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
 
 	uploader := newS3FileUploader(rc)
+	// Set progress tracker if available
+	if s.uploadProgress != nil {
+		uploader.WithProgressTracker(s.uploadProgress)
+	}
 	for i, part := range urls.Parts {
 		// Check context before each part upload
 		select {
@@ -198,8 +220,9 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 
 type s3FileUploader struct {
 	io.ReadCloser
-	client        *http.Client
-	uploadedParts []remote.BackupPart
+	client          *http.Client
+	uploadedParts   []remote.BackupPart
+	progressTracker ProgressTracker
 }
 
 // newS3FileUploader returns a new file uploader instance.
@@ -210,8 +233,15 @@ func newS3FileUploader(file io.ReadCloser) *s3FileUploader {
 		// a 5GB file. This assumes at worst a 10Mbps connection for uploading. While technically
 		// you could go slower we're targeting mostly hosted servers that should have 100Mbps
 		// connections anyways.
-		client: &http.Client{Timeout: time.Hour * 2},
+		client:          &http.Client{Timeout: time.Hour * 2},
+		progressTracker: nil, // Set via WithProgressTracker method
 	}
+}
+
+// WithProgressTracker sets the progress tracker for upload progress
+func (fu *s3FileUploader) WithProgressTracker(progress ProgressTracker) *s3FileUploader {
+	fu.progressTracker = progress
+	return fu
 }
 
 // backoff returns a new expoential backoff implementation using a context that
@@ -247,7 +277,14 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 	r.Header.Add("Content-Type", "application/octet-stream")
 
 	// Limit the reader to the size of the part - prevents over-read attacks
-	r.Body = Reader{Reader: io.LimitReader(fu.ReadCloser, size)}
+	limitedReader := io.LimitReader(fu.ReadCloser, size)
+	
+	// Wrap with progress tracking if available
+	if fu.progressTracker != nil {
+		r.Body = Reader{Reader: NewProgressReader(limitedReader, fu.progressTracker)}
+	} else {
+		r.Body = Reader{Reader: limitedReader}
+	}
 
 	var etag string
 	err = backoff.Retry(func() error {
@@ -295,5 +332,39 @@ type Reader struct {
 }
 
 func (Reader) Close() error {
+	return nil
+}
+
+// ProgressReader wraps an io.Reader and tracks bytes read for progress updates
+type ProgressReader struct {
+	reader   io.Reader
+	progress ProgressTracker
+	mutex    sync.Mutex
+}
+
+// NewProgressReader creates a new progress-aware reader
+func NewProgressReader(reader io.Reader, progress ProgressTracker) *ProgressReader {
+	return &ProgressReader{
+		reader:   reader,
+		progress: progress,
+	}
+}
+
+// Read implements io.Reader and updates progress as bytes are read
+func (pr *ProgressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.reader.Read(p)
+	if n > 0 && pr.progress != nil {
+		pr.mutex.Lock()
+		pr.progress.AddWritten(uint64(n))
+		pr.mutex.Unlock()
+	}
+	return n, err
+}
+
+// Close implements io.Closer (no-op for compatibility)
+func (pr *ProgressReader) Close() error {
+	if closer, ok := pr.reader.(io.Closer); ok {
+		return closer.Close()
+	}
 	return nil
 }
