@@ -63,24 +63,34 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	isInitialProgress := lastTime == 0 && lastSent == 0
 
 	if total > 0 {
-		// S3 SPECIAL CASE: 80/20 split (archive/upload)
-		if spt.isS3 && spt.archiveSize > 0 {
-			// Determine which phase we're in
-			if written <= spt.archiveSize {
-				// Archive phase: 0-80% based on archive progress
-				percentage = int((written * 80) / spt.archiveSize)
+		// Standard percentage calculation first
+		rawPercentage := int((written * 100) / total)
+		
+		// S3 SPECIAL CASE: Scale to 80% during archive, then 80-100% during upload
+		if spt.isS3 {
+			// During archive phase (before SetS3Mode is called with actual size)
+			if spt.archiveSize == 0 {
+				// Archive phase: scale 0-100% to 0-80%
+				percentage = min(80, (rawPercentage * 80) / 100)
 			} else {
-				// Upload phase: 80-100% based on upload progress
-				uploadBytes := written - spt.archiveSize
-				uploadTotal := spt.archiveSize // Assume upload size ≈ archive size
-				uploadPercent := int((uploadBytes * 20) / uploadTotal)
-				percentage = 80 + min(20, uploadPercent)
+				// Upload phase: we know the actual archive size now
+				// Archive bytes are already written, now tracking upload
+				archiveBytes := total // The original total was the archive content
+				uploadBytes := written - archiveBytes
+				if uploadBytes > 0 {
+					// Upload progress: 80% + (upload_progress * 20%)
+					uploadPercent := int((uploadBytes * 100) / spt.archiveSize)
+					percentage = 80 + min(20, (uploadPercent * 20) / 100)
+				} else {
+					// Still in archive phase or just finished
+					percentage = 80
+				}
 			}
-			percentage = min(100, percentage)
 		} else {
-			// Standard percentage for non-S3 or when archiveSize unknown
-			percentage = min(100, int((written*100)/total))
+			// Standard percentage for non-S3
+			percentage = rawPercentage
 		}
+		percentage = min(100, percentage)
 		
 		// Send on percentage increase AND time throttle (OR initial)
 		percentageChanged := percentage > int(lastSent)

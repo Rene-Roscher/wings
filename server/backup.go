@@ -1046,19 +1046,11 @@ func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3B
 	// S3 PROGRESS: 80/20 split pattern for S3 backups
 	// Archive creation = 80%, Upload = 20%
 	
-	var originalTotal uint64
-	if progressInstance != nil {
-		originalTotal = progressInstance.Total()
-		if originalTotal > 0 && progressTracker != nil {
-			// Configure tracker for S3 80/20 mode
-			progressTracker.SetS3Mode(int64(originalTotal))
-			
-			// Double the total so archive reaches "80%" when complete
-			// (archive writes originalTotal bytes, which should be 80% of 2x total)
-			doubledTotal := originalTotal * 2
-			progressInstance.SetTotal(doubledTotal)
-			s.Log().WithField("original_total", originalTotal).WithField("doubled_total", doubledTotal).Debug("configured S3 backup progress for 80/20 split")
-		}
+	// Configure tracker for S3 80/20 mode from the start
+	if progressTracker != nil {
+		// Mark as S3 immediately, archive size will be set later
+		progressTracker.SetS3Mode(0)
+		s.Log().Debug("configured S3 backup progress tracker for 80/20 split")
 	}
 
 	// Phase 1: Create local archive with progress tracking
