@@ -371,21 +371,31 @@ func postServerRestoreBackup(c *gin.Context) {
 		if res.ContentLength > 0 {
 			logger.WithField("size_mb", res.ContentLength/(1024*1024)).Info("S3 backup download size known, adding download progress tracking")
 			
-			// Progress callback for download tracking
+			// Progress callback for download tracking - send WebSocket events!
 			onProgress := func(downloaded, total int64) {
-				// Calculate download percentage (0-80% for download, 80-100% for extraction)
+				// Calculate percentage for download phase
 				percentage := 0
 				if total > 0 {
-					percentage = int((downloaded * 80) / total)
+					percentage = int((downloaded * 100) / total)
 				}
 				
-				// Log progress (WebSocket events are handled by server layer)
-				if percentage%10 == 0 {
+				// Send WebSocket event for download progress
+				// This gives immediate feedback to the user
+				s.Events().Publish(server.BackupProgressEvent, server.BackupProgressUpdate{
+					BackupID:     uuid,
+					Type:         "download", // Special type for download phase
+					Percentage:   percentage,
+					BytesWritten: downloaded,
+					BytesTotal:   total,
+				})
+				
+				// Also log for debugging
+				if percentage%10 == 0 || downloaded == total {
 					logger.WithFields(log.Fields{
 						"downloaded_percentage": percentage,
 						"downloaded_mb": downloaded / (1024 * 1024),
 						"total_mb": total / (1024 * 1024),
-					}).Debug("S3 download progress")
+					}).Info("S3 download progress")
 				}
 			}
 			
