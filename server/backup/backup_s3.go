@@ -436,10 +436,11 @@ func (Reader) Close() error {
 
 // ProgressReader wraps an io.Reader and tracks bytes read for progress updates
 type ProgressReader struct {
-	reader   io.Reader
-	progress ProgressTracker
-	callback func() // Optional callback for progress updates
-	mutex    sync.Mutex
+	reader       io.Reader
+	progress     ProgressTracker
+	callback     func() // Optional callback for progress updates
+	lastCallback int64  // Last time callback was triggered (unix nano)
+	mutex        sync.Mutex
 }
 
 // NewProgressReader creates a new progress-aware reader
@@ -463,9 +464,23 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 	if n > 0 && pr.progress != nil {
 		pr.mutex.Lock()
 		pr.progress.AddWritten(uint64(n))
-		// Trigger callback if set (for WebSocket events)
+		
+		// Trigger callback if set, but throttle to max once per 250ms
 		if pr.callback != nil {
-			pr.callback()
+			now := time.Now().UnixNano()
+			// Send update if 250ms have passed since last callback
+			if now-pr.lastCallback >= 250_000_000 { // 250ms in nanoseconds
+				pr.lastCallback = now
+				// Recover from panic in callback - progress events must never break uploads
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Silently ignore - progress is non-critical
+						}
+					}()
+					pr.callback()
+				}()
+			}
 		}
 		pr.mutex.Unlock()
 	}
