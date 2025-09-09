@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -360,37 +361,95 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 		return "", errors.New("backup: invalid part size for S3 upload")
 	}
 	
-	r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, nil)
-	if err != nil {
-		return "", errors.Wrap(err, "backup: could not create request for S3")
-	}
-
-	r.ContentLength = size
-	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-	// Use generic content type since we support multiple compression formats
-	// The actual format will be auto-detected during restore
-	r.Header.Add("Content-Type", "application/octet-stream")
-
-	// Limit the reader to the size of the part - prevents over-read attacks
-	limitedReader := io.LimitReader(fu.ReadCloser, size)
+	// For parts <=100MB, buffer for retry support. For larger parts, accept retry failure.
+	const maxBufferSize = 100 * 1024 * 1024 // 100MB threshold
+	var partReader io.Reader
+	var canRetry bool
 	
-	// Wrap with progress tracking if available
-	if fu.progressTracker != nil {
-		progressReader := NewProgressReader(limitedReader, fu.progressTracker)
-		if fu.progressCallback != nil {
-			progressReader.WithCallback(fu.progressCallback)
+	if size <= maxBufferSize {
+		// Small part - buffer it for retry support
+		partData := make([]byte, size)
+		n, err := io.ReadFull(fu.ReadCloser, partData)
+		if err != nil {
+			return "", errors.Wrap(err, "backup: failed to read part data")
 		}
-		r.Body = Reader{Reader: progressReader}
+		if int64(n) != size {
+			return "", errors.New(fmt.Sprintf("backup: read %d bytes but expected %d", n, size))
+		}
+		partReader = bytes.NewReader(partData)
+		canRetry = true
+		
+		// Don't update progress here for buffered parts!
+		// Progress will be simulated during actual upload to show network transfer
+		// This prevents the progress bar from jumping to completion before upload starts
 	} else {
-		r.Body = Reader{Reader: limitedReader}
+		// Large part - stream directly, no retry on network failure
+		partReader = io.LimitReader(fu.ReadCloser, size)
+		canRetry = false
 	}
-
+	
 	var etag string
-	err = backoff.Retry(func() error {
+	attempt := 0
+	err := backoff.Retry(func() error {
+		attempt++
+		
+		// For large parts, only allow one attempt
+		if !canRetry && attempt > 1 {
+			return backoff.Permanent(errors.New("backup: cannot retry large part upload"))
+		}
+		
+		// Create new request for each attempt
+		r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, nil)
+		if err != nil {
+			return errors.Wrap(err, "backup: could not create request for S3")
+		}
+
+		r.ContentLength = size
+		r.Header.Add("Content-Length", strconv.Itoa(int(size)))
+		// Use generic content type since we support multiple compression formats
+		// The actual format will be auto-detected during restore
+		r.Header.Add("Content-Type", "application/octet-stream")
+
+		// For buffered parts, create new reader for each retry
+		// For streaming parts, use the limited reader with progress tracking
+		if canRetry {
+			// Reset reader for retry
+			if br, ok := partReader.(*bytes.Reader); ok {
+				br.Seek(0, 0)
+			}
+			// IMPORTANT: Add progress tracking for buffered uploads too!
+			// This simulates progress during network transfer
+			if fu.progressTracker != nil && attempt == 1 {
+				// Only track progress on first attempt to avoid double counting
+				progressReader := NewProgressReader(partReader, fu.progressTracker)
+				if fu.progressCallback != nil {
+					progressReader.WithCallback(fu.progressCallback)
+				}
+				r.Body = Reader{Reader: progressReader}
+			} else {
+				r.Body = Reader{Reader: partReader}
+			}
+		} else {
+			// Wrap with progress tracking for streaming upload
+			if fu.progressTracker != nil {
+				progressReader := NewProgressReader(partReader, fu.progressTracker)
+				if fu.progressCallback != nil {
+					progressReader.WithCallback(fu.progressCallback)
+				}
+				r.Body = Reader{Reader: progressReader}
+			} else {
+				r.Body = Reader{Reader: partReader}
+			}
+		}
+		
 		res, err := fu.client.Do(r)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				return backoff.Permanent(err)
+			}
+			// For non-retryable parts, make all errors permanent
+			if !canRetry {
+				return backoff.Permanent(errors.Wrap(err, "backup: S3 HTTP request failed (non-retryable)"))
 			}
 			// Don't use a permanent error here, if there is a temporary resolution error with
 			// the URL due to DNS issues we want to keep re-trying.
@@ -404,6 +463,9 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 			// the S3 endpoint. Any 4xx error should be treated as an error that a retry
 			// would not fix.
 			if res.StatusCode >= http.StatusInternalServerError {
+				if !canRetry {
+					return backoff.Permanent(err)
+				}
 				return err
 			}
 			return backoff.Permanent(err)
@@ -436,11 +498,12 @@ func (Reader) Close() error {
 
 // ProgressReader wraps an io.Reader and tracks bytes read for progress updates
 type ProgressReader struct {
-	reader       io.Reader
-	progress     ProgressTracker
-	callback     func() // Optional callback for progress updates
-	lastCallback int64  // Last time callback was triggered (unix nano)
-	mutex        sync.Mutex
+	reader           io.Reader
+	progress         ProgressTracker
+	callback         func() // Optional callback for progress updates
+	lastCallback     int64  // Last time callback was triggered (unix nano)
+	lastBytesWritten uint64 // Bytes written at last callback
+	mutex            sync.Mutex
 }
 
 // NewProgressReader creates a new progress-aware reader
@@ -463,26 +526,52 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 	n, err = pr.reader.Read(p)
 	if n > 0 && pr.progress != nil {
 		pr.mutex.Lock()
+		defer pr.mutex.Unlock() // CRITICAL: Always unlock, even on panic
+		
 		pr.progress.AddWritten(uint64(n))
 		
-		// Trigger callback if set, but throttle to max once per 250ms
+		// Trigger callback if set, with intelligent throttling
 		if pr.callback != nil {
 			now := time.Now().UnixNano()
-			// Send update if 250ms have passed since last callback
-			if now-pr.lastCallback >= 250_000_000 { // 250ms in nanoseconds
+			
+			// Dynamic throttling based on data rate:
+			// - For fast uploads (>10MB/s): throttle to 100ms
+			// - For normal uploads: throttle to 250ms  
+			// - Always send first and last update
+			bytesWritten := pr.progress.Written()
+			isFirst := pr.lastCallback == 0
+			isLast := err == io.EOF
+			
+			var throttleInterval int64 = 250_000_000 // Default 250ms
+			if !isFirst && pr.lastCallback > 0 {
+				// Calculate upload speed based on bytes since last callback
+				bytesDelta := bytesWritten - pr.lastBytesWritten
+				timeDelta := now - pr.lastCallback
+				if timeDelta > 0 && bytesDelta > 0 {
+					// Calculate bytes per second
+					bytesPerSecond := (bytesDelta * 1_000_000_000) / uint64(timeDelta)
+					if bytesPerSecond > 10*1024*1024 { // >10MB/s
+						throttleInterval = 100_000_000 // 100ms for fast uploads
+					}
+				}
+			}
+			
+			shouldSend := isFirst || isLast || (now-pr.lastCallback >= throttleInterval)
+			
+			if shouldSend {
 				pr.lastCallback = now
+				pr.lastBytesWritten = bytesWritten
 				// Recover from panic in callback - progress events must never break uploads
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							// Silently ignore - progress is non-critical
+							// Silently ignore panics - progress is not critical
 						}
 					}()
 					pr.callback()
 				}()
 			}
 		}
-		pr.mutex.Unlock()
 	}
 	return n, err
 }
