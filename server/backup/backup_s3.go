@@ -543,7 +543,25 @@ func (pr *ProgressReader) WithCallback(callback func()) *ProgressReader {
 
 // Read implements io.Reader and updates progress as bytes are read
 func (pr *ProgressReader) Read(p []byte) (n int, err error) {
+	// Limit read size to force more frequent updates
+	const maxChunk = 1024 * 1024 // 1MB max per read
+	if len(p) > maxChunk {
+		p = p[:maxChunk]
+	}
+	
 	n, err = pr.reader.Read(p)
+	
+	// Debug: Log every read call
+	if n > 0 && pr.progress != nil {
+		totalRead := pr.progress.Written()
+		log.WithFields(log.Fields{
+			"bytes_read": n,
+			"total_read": totalRead,
+			"buffer_size": len(p),
+			"is_eof": err == io.EOF,
+		}).Debug("S3 ProgressReader: Read called")
+	}
+	
 	if n > 0 && pr.progress != nil {
 		pr.mutex.Lock()
 		defer pr.mutex.Unlock() // CRITICAL: Always unlock, even on panic
@@ -591,13 +609,13 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 				pr.lastBytesWritten = bytesWritten
 				
 				// Debug log callback trigger
-				if isFirst || isLast {
-					log.WithFields(log.Fields{
-						"is_first": isFirst,
-						"is_last": isLast,
-						"bytes_written": bytesWritten,
-					}).Debug("S3 ProgressReader: Triggering progress callback")
-				}
+				log.WithFields(log.Fields{
+					"is_first": isFirst,
+					"is_last": isLast,
+					"bytes_written": bytesWritten,
+					"should_send": shouldSend,
+					"throttle_ms": throttleInterval / 1_000_000,
+				}).Debug("S3 ProgressReader: Callback check")
 				
 				// Recover from panic in callback - progress events must never break uploads
 				func() {
