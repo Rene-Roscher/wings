@@ -25,6 +25,8 @@ type S3Backup struct {
 	Backup
 	// Progress tracker for upload phase (optional)
 	uploadProgress ProgressTracker
+	// Progress callback for upload phase (optional)
+	uploadCallback func()
 }
 
 // ProgressTracker interface for S3 upload progress tracking
@@ -52,6 +54,12 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 // WithUploadProgress sets the progress tracker for S3 upload phase
 func (s *S3Backup) WithUploadProgress(progress ProgressTracker) *S3Backup {
 	s.uploadProgress = progress
+	return s
+}
+
+// WithUploadCallback sets the callback to trigger on upload progress
+func (s *S3Backup) WithUploadCallback(callback func()) *S3Backup {
+	s.uploadCallback = callback
 	return s
 }
 
@@ -255,9 +263,12 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
 
 	uploader := newS3FileUploader(rc)
-	// Set progress tracker if available
+	// Set progress tracker and callback if available
 	if s.uploadProgress != nil {
 		uploader.WithProgressTracker(s.uploadProgress)
+		if s.uploadCallback != nil {
+			uploader.WithProgressCallback(s.uploadCallback)
+		}
 	}
 	for i, part := range urls.Parts {
 		// Check context before each part upload
@@ -300,6 +311,7 @@ type s3FileUploader struct {
 	client          *http.Client
 	uploadedParts   []remote.BackupPart
 	progressTracker ProgressTracker
+	progressCallback func()
 }
 
 // newS3FileUploader returns a new file uploader instance.
@@ -318,6 +330,12 @@ func newS3FileUploader(file io.ReadCloser) *s3FileUploader {
 // WithProgressTracker sets the progress tracker for upload progress
 func (fu *s3FileUploader) WithProgressTracker(progress ProgressTracker) *s3FileUploader {
 	fu.progressTracker = progress
+	return fu
+}
+
+// WithProgressCallback sets the callback for upload progress
+func (fu *s3FileUploader) WithProgressCallback(callback func()) *s3FileUploader {
+	fu.progressCallback = callback
 	return fu
 }
 
@@ -358,7 +376,11 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 	
 	// Wrap with progress tracking if available
 	if fu.progressTracker != nil {
-		r.Body = Reader{Reader: NewProgressReader(limitedReader, fu.progressTracker)}
+		progressReader := NewProgressReader(limitedReader, fu.progressTracker)
+		if fu.progressCallback != nil {
+			progressReader.WithCallback(fu.progressCallback)
+		}
+		r.Body = Reader{Reader: progressReader}
 	} else {
 		r.Body = Reader{Reader: limitedReader}
 	}
@@ -416,6 +438,7 @@ func (Reader) Close() error {
 type ProgressReader struct {
 	reader   io.Reader
 	progress ProgressTracker
+	callback func() // Optional callback for progress updates
 	mutex    sync.Mutex
 }
 
@@ -424,7 +447,14 @@ func NewProgressReader(reader io.Reader, progress ProgressTracker) *ProgressRead
 	return &ProgressReader{
 		reader:   reader,
 		progress: progress,
+		callback: nil,
 	}
+}
+
+// WithCallback sets an optional callback to be triggered on progress updates
+func (pr *ProgressReader) WithCallback(callback func()) *ProgressReader {
+	pr.callback = callback
+	return pr
 }
 
 // Read implements io.Reader and updates progress as bytes are read
@@ -433,6 +463,10 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 	if n > 0 && pr.progress != nil {
 		pr.mutex.Lock()
 		pr.progress.AddWritten(uint64(n))
+		// Trigger callback if set (for WebSocket events)
+		if pr.callback != nil {
+			pr.callback()
+		}
 		pr.mutex.Unlock()
 	}
 	return n, err

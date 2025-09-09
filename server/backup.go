@@ -710,7 +710,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) e
 }
 
 // generateBackupWithProgress creates a backup with progress tracking and context support
-func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.BackupInterface, ignored string, progressInstance *progress.Progress, _ *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
+func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.BackupInterface, ignored string, progressInstance *progress.Progress, progressTracker *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
 	// For local backups, we need to inject the progress tracker into the archive
 	if localBackup, ok := b.(*backup.LocalBackup); ok {
 		return s.generateLocalBackupWithProgress(ctx, localBackup, ignored, progressInstance)
@@ -718,7 +718,7 @@ func (s *Server) generateBackupWithProgress(ctx context.Context, b backup.Backup
 
 	// For S3 backups, we also need progress tracking
 	if s3Backup, ok := b.(*backup.S3Backup); ok {
-		return s.generateS3BackupWithProgress(ctx, s3Backup, ignored, progressInstance)
+		return s.generateS3BackupWithProgress(ctx, s3Backup, ignored, progressInstance, progressTracker)
 	}
 
 	// Fallback to original Generate method if backup type is unknown
@@ -1042,7 +1042,7 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 
 // generateS3BackupWithProgress creates an S3 backup with progress tracking and context support
 // UNIFIED BEHAVIOR: Uses same progress pattern as Local backups for consistency (WORK.md compliance)
-func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
+func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, progressInstance *progress.Progress, progressTracker *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
 	// UNIFIED PROGRESS: Standard 80/20 split pattern used by both S3 and Local backups
 	// Archive creation = 80%, Upload/Finalization = 20%
 	// This ensures identical user experience across storage types (WORK.md requirement)
@@ -1078,9 +1078,13 @@ func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3B
 	// Phase 2: S3 upload with REAL progress tracking (remaining 20%)
 	s.Log().Debug("S3 upload phase starting with real progress tracking")
 	
-	// Set up real progress tracking for S3 upload
-	if progressInstance != nil {
+	// Set up real progress tracking for S3 upload with WebSocket callback
+	if progressInstance != nil && progressTracker != nil {
 		b.WithUploadProgress(progressInstance)
+		// Set the callback to trigger WebSocket events during upload
+		b.WithUploadCallback(func() {
+			progressTracker.CheckProgress()
+		})
 	}
 
 	// Perform actual S3 upload with real progress tracking
