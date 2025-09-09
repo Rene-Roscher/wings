@@ -12,13 +12,15 @@ import (
 
 // SimpleProgressTracker - ultra-lightweight progress tracking with ZERO overhead
 type SimpleProgressTracker struct {
-	server      *Server
-	backupID    string
-	backupType  string
-	progress    *progress.Progress
-	lastSent    int64 // Last percentage sent
-	lastTime    int64 // Last time sent (nanoseconds)
-	lastBytes   int64 // Last bytes value sent (for detecting changes at 100%)
+	server       *Server
+	backupID     string
+	backupType   string
+	progress     *progress.Progress
+	lastSent     int64 // Last percentage sent
+	lastTime     int64 // Last time sent (nanoseconds)
+	lastBytes    int64 // Last bytes value sent (for detecting changes at 100%)
+	isS3         bool  // Whether this is an S3 backup (needs 80/20 split)
+	archiveSize  int64 // Size of archive (for S3 80/20 calculation)
 	
 	// Context-aware goroutine management
 	ctx        context.Context
@@ -61,15 +63,31 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 	isInitialProgress := lastTime == 0 && lastSent == 0
 
 	if total > 0 {
-		// Percentage mode - responsive but throttled
-		percentage = min(100, int((written*100)/total))
+		// S3 SPECIAL CASE: 80/20 split (archive/upload)
+		if spt.isS3 && spt.archiveSize > 0 {
+			// Determine which phase we're in
+			if written <= spt.archiveSize {
+				// Archive phase: 0-80% based on archive progress
+				percentage = int((written * 80) / spt.archiveSize)
+			} else {
+				// Upload phase: 80-100% based on upload progress
+				uploadBytes := written - spt.archiveSize
+				uploadTotal := spt.archiveSize // Assume upload size ≈ archive size
+				uploadPercent := int((uploadBytes * 20) / uploadTotal)
+				percentage = 80 + min(20, uploadPercent)
+			}
+			percentage = min(100, percentage)
+		} else {
+			// Standard percentage for non-S3 or when archiveSize unknown
+			percentage = min(100, int((written*100)/total))
+		}
+		
 		// Send on percentage increase AND time throttle (OR initial)
 		percentageChanged := percentage > int(lastSent)
-		// CRITICAL FIX: For S3 uploads, written can exceed total (archive + upload)
-		// Continue sending updates based on byte changes even at 100%
+		// Also send if bytes changed (for updates within same percentage)
 		lastBytesVal := atomic.LoadInt64(&spt.lastBytes)
 		bytesChanged := int64(written) != lastBytesVal
-		shouldSend = ((percentageChanged || (percentage == 100 && bytesChanged)) && shouldSendByTime) || isInitialProgress
+		shouldSend = ((percentageChanged || bytesChanged) && shouldSendByTime) || isInitialProgress
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, int64(percentage))
 			atomic.StoreInt64(&spt.lastBytes, int64(written))
@@ -169,7 +187,14 @@ func NewSimpleProgressTracker(ctx context.Context, server *Server, backupID, bac
 		progress:   progress,
 		ctx:        progCtx,
 		cancel:     cancel,
+		isS3:       false, // Will be set via SetS3Mode if needed
 	}
+}
+
+// SetS3Mode configures the tracker for S3 80/20 split
+func (spt *SimpleProgressTracker) SetS3Mode(archiveSize int64) {
+	spt.isS3 = true
+	spt.archiveSize = archiveSize
 }
 
 // Close cleans up all goroutines and resources

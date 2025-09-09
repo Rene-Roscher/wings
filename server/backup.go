@@ -1043,19 +1043,21 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 // generateS3BackupWithProgress creates an S3 backup with progress tracking and context support
 // UNIFIED BEHAVIOR: Uses same progress pattern as Local backups for consistency (WORK.md compliance)
 func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3Backup, ignored string, progressInstance *progress.Progress, progressTracker *SimpleProgressTracker) (*backup.ArchiveDetails, error) {
-	// UNIFIED PROGRESS: Standard 80/20 split pattern used by both S3 and Local backups
-	// Archive creation = 80%, Upload/Finalization = 20%
-	// This ensures identical user experience across storage types (WORK.md requirement)
+	// S3 PROGRESS: 80/20 split pattern for S3 backups
+	// Archive creation = 80%, Upload = 20%
 	
+	var originalTotal uint64
 	if progressInstance != nil {
-		originalTotal := progressInstance.Total()
-		if originalTotal > 0 {
-			// Scale total to account for S3 upload phase
-			// Archive creation will write originalTotal bytes (now = 80% of new total)
-			// Upload simulation will add 25% more bytes (now = 20% of new total)
-			scaledTotal := originalTotal * 10 / 8 // Archive (originalTotal) = 80% of scaledTotal
-			progressInstance.SetTotal(scaledTotal)
-			s.Log().WithField("original_total", originalTotal).WithField("scaled_total", scaledTotal).Debug("scaled S3 backup progress total")
+		originalTotal = progressInstance.Total()
+		if originalTotal > 0 && progressTracker != nil {
+			// Configure tracker for S3 80/20 mode
+			progressTracker.SetS3Mode(int64(originalTotal))
+			
+			// Double the total so archive reaches "80%" when complete
+			// (archive writes originalTotal bytes, which should be 80% of 2x total)
+			doubledTotal := originalTotal * 2
+			progressInstance.SetTotal(doubledTotal)
+			s.Log().WithField("original_total", originalTotal).WithField("doubled_total", doubledTotal).Debug("configured S3 backup progress for 80/20 split")
 		}
 	}
 
@@ -1073,7 +1075,14 @@ func (s *Server) generateS3BackupWithProgress(ctx context.Context, b *backup.S3B
 	}
 	s.Log().WithField("backup", b.Identifier()).Info("created S3 backup archive - starting S3 upload")
 
-	// At this point, progress should show ~80% (originalTotal bytes written out of scaledTotal)
+	// Get actual archive size for accurate 80/20 split
+	if progressTracker != nil {
+		if stat, err := os.Stat(b.Path()); err == nil {
+			archiveSize := stat.Size()
+			progressTracker.SetS3Mode(archiveSize)
+			s.Log().WithField("archive_size", archiveSize).Debug("set S3 tracker archive size for 80/20 split")
+		}
+	}
 
 	// Phase 2: S3 upload with REAL progress tracking (remaining 20%)
 	s.Log().Debug("S3 upload phase starting with real progress tracking")
