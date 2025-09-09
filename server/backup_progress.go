@@ -12,12 +12,13 @@ import (
 
 // SimpleProgressTracker - ultra-lightweight progress tracking with ZERO overhead
 type SimpleProgressTracker struct {
-	server     *Server
-	backupID   string
-	backupType string
-	progress   *progress.Progress
-	lastSent   int64 // Last percentage sent
-	lastTime   int64 // Last time sent (nanoseconds)
+	server      *Server
+	backupID    string
+	backupType  string
+	progress    *progress.Progress
+	lastSent    int64 // Last percentage sent
+	lastTime    int64 // Last time sent (nanoseconds)
+	lastBytes   int64 // Last bytes value sent (for detecting changes at 100%)
 	
 	// Context-aware goroutine management
 	ctx        context.Context
@@ -64,9 +65,14 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		percentage = min(100, int((written*100)/total))
 		// Send on percentage increase AND time throttle (OR initial)
 		percentageChanged := percentage > int(lastSent)
-		shouldSend = (percentageChanged && shouldSendByTime) || isInitialProgress
+		// CRITICAL FIX: For S3 uploads, written can exceed total (archive + upload)
+		// Continue sending updates based on byte changes even at 100%
+		lastBytesVal := atomic.LoadInt64(&spt.lastBytes)
+		bytesChanged := int64(written) != lastBytesVal
+		shouldSend = ((percentageChanged || (percentage == 100 && bytesChanged)) && shouldSendByTime) || isInitialProgress
 		if shouldSend {
 			atomic.StoreInt64(&spt.lastSent, int64(percentage))
+			atomic.StoreInt64(&spt.lastBytes, int64(written))
 		}
 	} else {
 		// Byte mode - show progress in 1MB chunks with time throttling  
