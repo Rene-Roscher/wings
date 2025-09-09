@@ -503,6 +503,12 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 			progressTracker.SendFinalProgress(err == nil)
 			progressTracker.Close()
 		}
+		
+		// Send the restore completed event HERE, while we're still in restore state
+		// This ensures the event is sent before state reset
+		s.Events().Publish(BackupRestoreCompletedEvent, map[string]any{
+			"successful": err == nil,
+		})
 	}()
 
 	// Don't try to restore the server until we have completely stopped the running
@@ -568,6 +574,13 @@ func (s *Server) RestoreBackupWithContext(ctx context.Context, b backup.BackupIn
 		estimatedTotal := backupSize.Size * 2
 		restoreProgress.SetTotal(uint64(estimatedTotal))
 		s.Log().WithField("backup_size", backupSize.Size).WithField("estimated_restore_size", estimatedTotal).Debug("set restore progress total")
+	} else {
+		// If we can't get the size, use a reasonable estimate for progress tracking
+		// This ensures percentage calculation works even without knowing exact size
+		// We'll update it as we go
+		estimatedTotal := int64(10 * 1024 * 1024 * 1024) // 10GB estimate
+		restoreProgress.SetTotal(uint64(estimatedTotal))
+		s.Log().WithField("estimated_restore_size", estimatedTotal).Debug("using estimated size for restore progress")
 	}
 
 	progressTracker = NewSimpleProgressTracker(ctx, s, b.Identifier(), "restore", restoreProgress)

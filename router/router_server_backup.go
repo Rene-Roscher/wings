@@ -240,20 +240,15 @@ func postServerRestoreBackup(c *gin.Context) {
 			if err := s.RestoreBackupWithContext(ctx, b, nil); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
 				s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from local backup: " + err.Error())
-				s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
-					"successful": false,
-					"error": err.Error(),
-				})
+				// BackupRestoreCompletedEvent is now sent by RestoreBackupWithContext
 			} else {
 				logger.WithFields(log.Fields{
 					"is_restoring": s.IsRestoring(),
 					"server_state": s.Environment.State(),
-				}).Info("Local restore completed successfully - sending completion events")
+				}).Info("Local restore completed successfully")
 				
 				s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
-				s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
-					"successful": true,
-				})
+				// BackupRestoreCompletedEvent is now sent by RestoreBackupWithContext
 				logger.Info("completed server restoration from local backup")
 			}
 		}(s, b, logger)
@@ -400,20 +395,15 @@ func postServerRestoreBackup(c *gin.Context) {
 		if err := s.RestoreBackupWithContext(ctx, s3Backup, downloadReader); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote S3 backup to server")
 			s.Events().Publish(server.DaemonMessageEvent, "Failed server restoration from S3 backup: " + err.Error())
-			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
-				"successful": false,
-				"error": err.Error(),
-			})
+			// BackupRestoreCompletedEvent is now sent by RestoreBackupWithContext
 		} else {
 			logger.WithFields(log.Fields{
 				"is_restoring": s.IsRestoring(),
 				"server_state": s.Environment.State(),
-			}).Info("S3 restore completed successfully - sending completion events")
+			}).Info("S3 restore completed successfully")
 			
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from S3 backup.")
-			s.Events().Publish(server.BackupRestoreCompletedEvent, map[string]any{
-				"successful": true,
-			})
+			// BackupRestoreCompletedEvent is now sent by RestoreBackupWithContext
 			logger.Info("completed server restoration from S3 backup")
 		}
 	}(s, c.Param("backup"), logger)
