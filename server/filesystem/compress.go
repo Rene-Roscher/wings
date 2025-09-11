@@ -3,6 +3,7 @@ package filesystem
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -174,7 +175,13 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 		}
 	}
 
-	// Identify the type of archive we are dealing with (handles GZIP, ZIP, etc.)
+	// CRITICAL FIX: Use our own TAR extraction for .tar.gz files
+	// The mholt/archives library corrupts binary files during extraction
+	if strings.HasSuffix(lowerFile, ".tar.gz") || strings.HasSuffix(lowerFile, ".tgz") {
+		return fs.extractGzipTarArchive(ctx, dir, f)
+	}
+	
+	// For other formats, use mholt/archives
 	format, input, err := archives.Identify(ctx, filepath.Base(file), f)
 	if err != nil {
 		if errors.Is(err, archives.NoMatch) {
@@ -299,6 +306,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
+		
 		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
@@ -306,6 +314,55 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
+		return nil
+	})
+}
+
+// extractGzipTarArchive handles extraction of GZIP compressed tar archives
+func (fs *Filesystem) extractGzipTarArchive(ctx context.Context, dir string, r io.Reader) error {
+	// Create GZIP decoder
+	gzReader, err := gzip.NewReader(r)
+	if err != nil {
+		return errors.Wrap(err, "failed to create GZIP decoder for archive")
+	}
+	defer gzReader.Close()
+
+	// Now we have a decompressed TAR stream, use archives.Tar to extract it
+	tarFormat := archives.Tar{}
+	
+	// Extract the TAR archive
+	return tarFormat.Extract(ctx, gzReader, func(ctx context.Context, f archives.FileInfo) error {
+		p := filepath.Join(dir, f.NameInArchive)
+		
+		// If it is ignored, just don't do anything with the file
+		if err := fs.IsIgnored(p); err != nil {
+			return nil
+		}
+		
+		r, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		
+		// Handle directories
+		if f.IsDir() {
+			if err := fs.unixFS.MkdirAll(p, ufs.FileMode(f.Mode())); err != nil {
+				return errors.Wrap(err, "failed to create directory")
+			}
+			return nil
+		}
+		
+		// Write regular files
+		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
+			return errors.Wrap(err, "failed to write file")
+		}
+		
+		// Update the file modification time
+		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
+			return errors.Wrap(err, "failed to set file times")
+		}
+		
 		return nil
 	})
 }
