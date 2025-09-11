@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
-	"runtime"
 
 	"emperror.dev/errors"
 	"github.com/klauspost/compress/zstd"
@@ -63,13 +62,9 @@ func CreateDecompressor(reader io.ReadCloser, format CompressionFormat) (io.Read
 	
 	switch format {
 	case CompressionZstd:
-		// Create ZSTD decoder with memory limits for security
-		// IMPORTANT: Do NOT use WithDecoderLowmem(true) as it can cause data corruption
-		// with certain compression settings, especially for binary files
-		decoder, err := zstd.NewReader(reader,
-			zstd.WithDecoderConcurrency(min(4, runtime.NumCPU())), // Allow up to 4 threads for better performance
-			zstd.WithDecoderMaxMemory(512*1024*1024), // 512MB memory limit for safety
-		)
+		// Create ZSTD decoder with DEFAULT settings for maximum compatibility
+		// NO options to avoid any potential corruption issues
+		decoder, err := zstd.NewReader(reader)
 		if err != nil {
 			reader.Close() // Clean up on error
 			return nil, errors.Wrap(err, "backup: failed to create ZSTD decoder")

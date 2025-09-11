@@ -3,7 +3,7 @@ package server
 import (
 	"archive/tar"
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -262,7 +262,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 			"uuid":          b.Identifier(),
 			"is_successful": false,
 			"checksum":      "",
-			"checksum_type": "sha1",
+			"checksum_type": "sha256",
 			"file_size":     0,
 			"error":         originalErr.Error(),
 		})
@@ -306,7 +306,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		"uuid":          b.Identifier(),
 		"is_successful": true,
 		"checksum":      ad.Checksum,
-		"checksum_type": "sha1",
+		"checksum_type": "sha256",
 		"file_size":     ad.Size,
 	})
 
@@ -842,7 +842,7 @@ func (s *Server) validateBackupContent(backupPath, serverPath string) error {
 
 	// Get backup file SHA1 (reuse existing checksum method)
 	if backupFile, err := os.Open(backupPath); err == nil {
-		hasher := sha1.New()
+		hasher := sha256.New()
 		if _, err := io.Copy(hasher, backupFile); err == nil {
 			backupChecksum = hex.EncodeToString(hasher.Sum(nil))
 		}
@@ -850,7 +850,7 @@ func (s *Server) validateBackupContent(backupPath, serverPath string) error {
 	}
 
 	// Get server directory content SHA1 (walk files and hash content)
-	if serverHash := sha1.New(); serverHash != nil {
+	if serverHash := sha256.New(); serverHash != nil {
 		err := filepath.Walk(serverPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil || path == serverPath || info.IsDir() {
 				return nil // Skip errors, root, and directories
@@ -876,8 +876,8 @@ func (s *Server) validateBackupContent(backupPath, serverPath string) error {
 		"original_dirs":       originalStats.DirCount,
 		"backup_files":        backupStats.FileCount,
 		"backup_dirs":         backupStats.DirCount,
-		"backup_sha1":         backupChecksum,
-		"server_content_sha1": serverChecksum,
+		"backup_sha256":         backupChecksum,
+		"server_content_sha256": serverChecksum,
 	}).Debug("backup content validation stats")
 
 	// 3. Compare file counts

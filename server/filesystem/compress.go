@@ -9,7 +9,6 @@ import (
 	iofs "io/fs"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -313,11 +312,9 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 
 // extractZstdTarArchive handles extraction of ZSTD compressed tar archives
 func (fs *Filesystem) extractZstdTarArchive(ctx context.Context, dir string, r io.Reader) error {
-	// Create ZSTD decoder
-	decoder, err := zstd.NewReader(r,
-		zstd.WithDecoderConcurrency(min(4, runtime.NumCPU())),
-		zstd.WithDecoderMaxMemory(512*1024*1024),
-	)
+	// Create ZSTD decoder with DEFAULT settings for maximum compatibility
+	// NO options to avoid any potential corruption issues
+	decoder, err := zstd.NewReader(r)
 	if err != nil {
 		return errors.Wrap(err, "failed to create ZSTD decoder for archive")
 	}

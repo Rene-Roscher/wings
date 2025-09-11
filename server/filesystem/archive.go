@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -365,17 +364,9 @@ func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
 	}
 }
 
-// createZstdWriter creates a zstd compressor with optimal settings
+// createZstdWriter creates a zstd compressor with safe default settings
 func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
-	// Calculate optimal thread count (max 4, based on CPU count)
-	threads := 2
-	if cpus := runtime.NumCPU(); cpus >= 9 {
-		threads = 4
-	} else if cpus >= 5 {
-		threads = 3
-	}
-
-	// Map compression level from config with optimal ZSTD settings
+	// Map compression level from config
 	var level zstd.EncoderLevel
 	switch config.Get().System.Backups.CompressionLevel {
 	case "none":
@@ -389,13 +380,9 @@ func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
 		level = zstd.SpeedBetterCompression // Good balance
 	}
 
-	return zstd.NewWriter(w,
-		zstd.WithEncoderLevel(level),
-		zstd.WithEncoderConcurrency(threads),
-		// IMPORTANT: Do NOT use WithLowerEncoderMem(true) as it can cause
-		// compatibility issues with decompression, especially for binary files
-		// The memory savings are minimal compared to the risk of data corruption
-	)
+	// Use DEFAULT zstd settings for maximum compatibility
+	// Avoid any fancy options that might cause issues
+	return zstd.NewWriter(w, zstd.WithEncoderLevel(level))
 }
 
 // createGzipWriter creates a gzip compressor with existing logic
