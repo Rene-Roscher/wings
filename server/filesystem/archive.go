@@ -392,8 +392,9 @@ func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
 	return zstd.NewWriter(w,
 		zstd.WithEncoderLevel(level),
 		zstd.WithEncoderConcurrency(threads),
-		zstd.WithLowerEncoderMem(true), // Reduce memory usage
-		// Removed WithAllLitEntropyCompression - can cause compatibility issues
+		// IMPORTANT: Do NOT use WithLowerEncoderMem(true) as it can cause
+		// compatibility issues with decompression, especially for binary files
+		// The memory savings are minimal compared to the risk of data corruption
 	)
 }
 

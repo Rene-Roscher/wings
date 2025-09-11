@@ -64,10 +64,11 @@ func CreateDecompressor(reader io.ReadCloser, format CompressionFormat) (io.Read
 	switch format {
 	case CompressionZstd:
 		// Create ZSTD decoder with memory limits for security
+		// IMPORTANT: Do NOT use WithDecoderLowmem(true) as it can cause data corruption
+		// with certain compression settings, especially for binary files
 		decoder, err := zstd.NewReader(reader,
-			zstd.WithDecoderConcurrency(min(2, runtime.NumCPU())), // Limit to 2 threads max
-			zstd.WithDecoderLowmem(true),
-			zstd.WithDecoderMaxMemory(256*1024*1024), // 256MB memory limit
+			zstd.WithDecoderConcurrency(min(4, runtime.NumCPU())), // Allow up to 4 threads for better performance
+			zstd.WithDecoderMaxMemory(512*1024*1024), // 512MB memory limit for safety
 		)
 		if err != nil {
 			reader.Close() // Clean up on error
@@ -115,10 +116,3 @@ func (zrc *zstdReadCloser) Close() error {
 	return nil
 }
 
-// min returns the minimum of two integers (Go 1.21+ has this built-in)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
