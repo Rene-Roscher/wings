@@ -366,23 +366,10 @@ func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
 
 // createZstdWriter creates a zstd compressor with safe default settings
 func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
-	// Map compression level from config
-	var level zstd.EncoderLevel
-	switch config.Get().System.Backups.CompressionLevel {
-	case "none":
-		return &nopWriteCloser{w}, nil
-	case "best_speed":
-		// FIXED: Use SpeedBetterCompression instead of SpeedFastest for better ratio
-		level = zstd.SpeedBetterCompression // Better balance: still fast but much better compression
-	case "best_compression":
-		level = zstd.SpeedBestCompression
-	default:
-		level = zstd.SpeedBetterCompression // Good balance
-	}
-
-	// Use DEFAULT zstd settings for maximum compatibility
-	// Avoid any fancy options that might cause issues
-	return zstd.NewWriter(w, zstd.WithEncoderLevel(level))
+	// CRITICAL FIX: Use absolutely NO options to avoid corruption
+	// The compression level options seem to cause binary file corruption
+	// Using default ZSTD writer without any options for maximum compatibility
+	return zstd.NewWriter(w)
 }
 
 // createGzipWriter creates a gzip compressor with existing logic
