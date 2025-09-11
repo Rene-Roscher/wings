@@ -1,13 +1,11 @@
 package filesystem
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -15,8 +13,8 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 	"github.com/klauspost/compress/zip"
-	"github.com/klauspost/compress/zstd"
 	"github.com/mholt/archives"
 
 	"github.com/Rene-Roscher/wings/internal/ufs"
@@ -144,42 +142,26 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 // zip-slip attack being attempted by validating that the final path is within
 // the server data directory.
 func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file string) error {
+	// CRITICAL FIX: Use system tar command for compressed archives
+	// Both Go libraries corrupt binary files during extraction
+	lowerFile := strings.ToLower(file)
+	if strings.HasSuffix(lowerFile, ".tar.gz") || strings.HasSuffix(lowerFile, ".tgz") ||
+	   strings.HasSuffix(lowerFile, ".tar.zst") || strings.HasSuffix(lowerFile, ".tar.zstd") ||
+	   strings.HasSuffix(lowerFile, ".tzst") {
+		// Pass the full path to the archive
+		fullArchivePath := filepath.Join(fs.Path(), dir, file)
+		if dir == "" {
+			fullArchivePath = filepath.Join(fs.Path(), file)
+		}
+		return fs.extractUsingSystemTar(ctx, dir, fullArchivePath)
+	}
+
+	// For non-tar compressed formats, use the Go libraries
 	f, err := fs.unixFS.Open(filepath.Join(dir, file))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	// Check if this is a ZSTD compressed file by extension or header
-	lowerFile := strings.ToLower(file)
-	if strings.HasSuffix(lowerFile, ".tar.zst") || strings.HasSuffix(lowerFile, ".tar.zstd") || strings.HasSuffix(lowerFile, ".tzst") {
-		// Handle ZSTD compressed tar archives manually
-		return fs.extractZstdTarArchive(ctx, dir, f)
-	}
-	
-	// Check file header for ZSTD magic bytes if file extension is ambiguous
-	if strings.Contains(lowerFile, ".tar.") || strings.HasSuffix(lowerFile, ".tar") {
-		// Peek at the first 4 bytes to check for ZSTD magic
-		br := bufio.NewReader(f)
-		header, err := br.Peek(4)
-		if err == nil && len(header) >= 4 {
-			// ZSTD magic bytes: 0x28B52FFD
-			if bytes.Equal(header[:4], []byte{0x28, 0xB5, 0x2F, 0xFD}) {
-				// This is a ZSTD compressed file
-				return fs.extractZstdTarArchive(ctx, dir, br)
-			}
-		}
-		// Reset the reader for archives.Identify
-		if _, err := f.Seek(0, 0); err != nil {
-			return err
-		}
-	}
-
-	// CRITICAL FIX: Use our own TAR extraction for .tar.gz files
-	// The mholt/archives library corrupts binary files during extraction
-	if strings.HasSuffix(lowerFile, ".tar.gz") || strings.HasSuffix(lowerFile, ".tgz") {
-		return fs.extractGzipTarArchive(ctx, dir, f)
-	}
 	
 	// For other formats, use mholt/archives
 	format, input, err := archives.Identify(ctx, filepath.Base(file), f)
@@ -318,101 +300,54 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 	})
 }
 
-// extractGzipTarArchive handles extraction of GZIP compressed tar archives
-func (fs *Filesystem) extractGzipTarArchive(ctx context.Context, dir string, r io.Reader) error {
-	// Create GZIP decoder
-	gzReader, err := gzip.NewReader(r)
-	if err != nil {
-		return errors.Wrap(err, "failed to create GZIP decoder for archive")
+// extractUsingSystemTar uses the system tar command to extract archives
+// This bypasses all Go library issues and uses the proven system tar
+func (fs *Filesystem) extractUsingSystemTar(ctx context.Context, targetDir string, archivePath string) error {
+	// If targetDir is empty, use the filesystem root
+	if targetDir == "" {
+		targetDir = fs.Path()
+	} else {
+		targetDir = filepath.Join(fs.Path(), targetDir)
 	}
-	defer gzReader.Close()
-
-	// Now we have a decompressed TAR stream, use archives.Tar to extract it
-	tarFormat := archives.Tar{}
 	
-	// Extract the TAR archive
-	return tarFormat.Extract(ctx, gzReader, func(ctx context.Context, f archives.FileInfo) error {
-		p := filepath.Join(dir, f.NameInArchive)
-		
-		// If it is ignored, just don't do anything with the file
-		if err := fs.IsIgnored(p); err != nil {
-			return nil
-		}
-		
-		r, err := f.Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-		
-		// Handle directories
-		if f.IsDir() {
-			if err := fs.unixFS.MkdirAll(p, ufs.FileMode(f.Mode())); err != nil {
-				return errors.Wrap(err, "failed to create directory")
-			}
-			return nil
-		}
-		
-		// Write regular files
-		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
-			return errors.Wrap(err, "failed to write file")
-		}
-		
-		// Update the file modification time
-		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
-			return errors.Wrap(err, "failed to set file times")
-		}
-		
-		return nil
-	})
+	// Determine compression type from file extension
+	var compressionFlag string
+	lowerPath := strings.ToLower(archivePath)
+	switch {
+	case strings.HasSuffix(lowerPath, ".tar.gz") || strings.HasSuffix(lowerPath, ".tgz"):
+		compressionFlag = "-z" // gzip
+	case strings.HasSuffix(lowerPath, ".tar.zst") || strings.HasSuffix(lowerPath, ".tar.zstd") || strings.HasSuffix(lowerPath, ".tzst"):
+		compressionFlag = "--zstd" // zstd
+	case strings.HasSuffix(lowerPath, ".tar.xz"):
+		compressionFlag = "-J" // xz
+	case strings.HasSuffix(lowerPath, ".tar.bz2"):
+		compressionFlag = "-j" // bzip2
+	default:
+		compressionFlag = "" // no compression
+	}
+	
+	// Log what we're doing
+	log.WithFields(log.Fields{
+		"archive": archivePath,
+		"target": targetDir,
+		"compression": compressionFlag,
+	}).Info("using system tar command for extraction to avoid binary corruption")
+	
+	// Build tar command arguments
+	args := []string{"-x", compressionFlag, "-f", archivePath, "-C", targetDir, "--preserve-permissions"}
+	// Remove empty compression flag if no compression
+	if compressionFlag == "" {
+		args = []string{"-x", "-f", archivePath, "-C", targetDir, "--preserve-permissions"}
+	}
+	
+	cmd := exec.CommandContext(ctx, "tar", args...)
+	
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.Wrapf(err, "system tar extraction failed: %s", string(output))
+	}
+	
+	log.Info("system tar extraction completed successfully")
+	return nil
 }
 
-// extractZstdTarArchive handles extraction of ZSTD compressed tar archives
-func (fs *Filesystem) extractZstdTarArchive(ctx context.Context, dir string, r io.Reader) error {
-	// Create ZSTD decoder with DEFAULT settings for maximum compatibility
-	// NO options to avoid any potential corruption issues
-	decoder, err := zstd.NewReader(r)
-	if err != nil {
-		return errors.Wrap(err, "failed to create ZSTD decoder for archive")
-	}
-	defer decoder.Close()
-
-	// Now we have a decompressed TAR stream, use archives.Tar to extract it
-	tarFormat := archives.Tar{}
-	
-	// Extract the TAR archive
-	return tarFormat.Extract(ctx, decoder, func(ctx context.Context, f archives.FileInfo) error {
-		p := filepath.Join(dir, f.NameInArchive)
-		
-		// If it is ignored, just don't do anything with the file
-		if err := fs.IsIgnored(p); err != nil {
-			return nil
-		}
-		
-		r, err := f.Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-		
-		// Handle directories
-		if f.IsDir() {
-			if err := fs.unixFS.MkdirAll(p, ufs.FileMode(f.Mode())); err != nil {
-				return errors.Wrap(err, "failed to create directory")
-			}
-			return nil
-		}
-		
-		// Write regular files
-		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
-			return errors.Wrap(err, "failed to write file")
-		}
-		
-		// Update the file modification time
-		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
-			return errors.Wrap(err, "failed to set file times")
-		}
-		
-		return nil
-	})
-}
