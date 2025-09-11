@@ -93,7 +93,12 @@ func (b *Backup) Identifier() string {
 
 // Path returns the path for this specific backup.
 func (b *Backup) Path() string {
-	// Generate extension based on backup format
+	// TEMPORARY: Force .tar.gz extension until ZSTD is fixed
+	// TODO: Re-enable ZSTD extension once corruption is resolved
+	extension := ".tar.gz"
+	
+	/*
+	// Original code - disabled due to ZSTD corruption
 	var extension string
 	switch config.Get().System.Backups.Format {
 	case "zstd":
@@ -105,6 +110,7 @@ func (b *Backup) Path() string {
 	default:
 		extension = ".tar.gz" // Default to gzip for backward compatibility
 	}
+	*/
 
 	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+extension)
 }

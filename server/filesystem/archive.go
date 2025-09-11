@@ -350,7 +350,14 @@ func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
 		writer = ratelimit.Writer(writer, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
 
-	// Choose compressor based on format setting
+	// TEMPORARY FIX: Force GZIP until ZSTD corruption is resolved
+	// The ZSTD library has issues with binary files that cause corruption
+	// TODO: Re-enable ZSTD once the underlying library issue is fixed
+	log.Warn("ZSTD temporarily disabled due to binary file corruption - using GZIP instead")
+	return a.createGzipWriter(writer)
+	
+	/*
+	// Original code - disabled due to ZSTD corruption issues
 	switch config.Get().System.Backups.Format {
 	case "zstd":
 		return a.createZstdWriter(writer)
@@ -362,6 +369,7 @@ func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
 		// Default to gzip for backward compatibility
 		return a.createGzipWriter(writer)
 	}
+	*/
 }
 
 // createZstdWriter creates a zstd compressor with safe default settings
