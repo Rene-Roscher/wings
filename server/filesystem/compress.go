@@ -1,18 +1,22 @@
 package filesystem
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	iofs "io/fs"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
 	"github.com/klauspost/compress/zip"
+	"github.com/klauspost/compress/zstd"
 	"github.com/mholt/archives"
 
 	"github.com/Rene-Roscher/wings/internal/ufs"
@@ -146,7 +150,32 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 	}
 	defer f.Close()
 
-	// Identify the type of archive we are dealing with.
+	// Check if this is a ZSTD compressed file by extension or header
+	lowerFile := strings.ToLower(file)
+	if strings.HasSuffix(lowerFile, ".tar.zst") || strings.HasSuffix(lowerFile, ".tar.zstd") || strings.HasSuffix(lowerFile, ".tzst") {
+		// Handle ZSTD compressed tar archives manually
+		return fs.extractZstdTarArchive(ctx, dir, f)
+	}
+	
+	// Check file header for ZSTD magic bytes if file extension is ambiguous
+	if strings.Contains(lowerFile, ".tar.") || strings.HasSuffix(lowerFile, ".tar") {
+		// Peek at the first 4 bytes to check for ZSTD magic
+		br := bufio.NewReader(f)
+		header, err := br.Peek(4)
+		if err == nil && len(header) >= 4 {
+			// ZSTD magic bytes: 0x28B52FFD
+			if bytes.Equal(header[:4], []byte{0x28, 0xB5, 0x2F, 0xFD}) {
+				// This is a ZSTD compressed file
+				return fs.extractZstdTarArchive(ctx, dir, br)
+			}
+		}
+		// Reset the reader for archives.Identify
+		if _, err := f.Seek(0, 0); err != nil {
+			return err
+		}
+	}
+
+	// Identify the type of archive we are dealing with (handles GZIP, ZIP, etc.)
 	format, input, err := archives.Identify(ctx, filepath.Base(file), f)
 	if err != nil {
 		if errors.Is(err, archives.NoMatch) {
@@ -278,6 +307,58 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
+		return nil
+	})
+}
+
+// extractZstdTarArchive handles extraction of ZSTD compressed tar archives
+func (fs *Filesystem) extractZstdTarArchive(ctx context.Context, dir string, r io.Reader) error {
+	// Create ZSTD decoder
+	decoder, err := zstd.NewReader(r,
+		zstd.WithDecoderConcurrency(min(4, runtime.NumCPU())),
+		zstd.WithDecoderMaxMemory(512*1024*1024),
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to create ZSTD decoder for archive")
+	}
+	defer decoder.Close()
+
+	// Now we have a decompressed TAR stream, use archives.Tar to extract it
+	tarFormat := archives.Tar{}
+	
+	// Extract the TAR archive
+	return tarFormat.Extract(ctx, decoder, func(ctx context.Context, f archives.FileInfo) error {
+		p := filepath.Join(dir, f.NameInArchive)
+		
+		// If it is ignored, just don't do anything with the file
+		if err := fs.IsIgnored(p); err != nil {
+			return nil
+		}
+		
+		r, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		
+		// Handle directories
+		if f.IsDir() {
+			if err := fs.unixFS.MkdirAll(p, ufs.FileMode(f.Mode())); err != nil {
+				return errors.Wrap(err, "failed to create directory")
+			}
+			return nil
+		}
+		
+		// Write regular files
+		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
+			return errors.Wrap(err, "failed to write file")
+		}
+		
+		// Update the file modification time
+		if err := fs.Chtimes(p, f.ModTime(), f.ModTime()); err != nil {
+			return errors.Wrap(err, "failed to set file times")
+		}
+		
 		return nil
 	})
 }
