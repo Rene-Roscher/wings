@@ -13,7 +13,6 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/juju/ratelimit"
-	"github.com/klauspost/compress/zstd"
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
 
@@ -344,36 +343,6 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 
 // createCompressor creates the appropriate compressor based on the configured format
 func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
-	// Apply rate limiting if configured
-	var writer io.Writer = w
-	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
-		writer = ratelimit.Writer(writer, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
-	}
-
-	// Choose compressor based on format setting
-	switch config.Get().System.Backups.Format {
-	case "zstd":
-		return a.createZstdWriter(writer)
-	case "gzip":
-		return a.createGzipWriter(writer)
-	case "none":
-		return &nopWriteCloser{writer}, nil
-	default:
-		// Default to gzip for backward compatibility
-		return a.createGzipWriter(writer)
-	}
-}
-
-// createZstdWriter creates a zstd compressor with safe default settings
-func (a *Archive) createZstdWriter(w io.Writer) (io.WriteCloser, error) {
-	// CRITICAL FIX: Use absolutely NO options to avoid corruption
-	// The compression level options seem to cause binary file corruption
-	// Using default ZSTD writer without any options for maximum compatibility
-	return zstd.NewWriter(w)
-}
-
-// createGzipWriter creates a gzip compressor with existing logic
-func (a *Archive) createGzipWriter(w io.Writer) (io.WriteCloser, error) {
 	// Choose which compression level to use based on the compression_level configuration option
 	var compressionLevel int
 	switch config.Get().System.Backups.CompressionLevel {
@@ -392,13 +361,4 @@ func (a *Archive) createGzipWriter(w io.Writer) (io.WriteCloser, error) {
 	}
 	_ = gw.SetConcurrency(1<<20, 1)
 	return gw, nil
-}
-
-// nopWriteCloser wraps an io.Writer to provide a no-op Close method
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nwc *nopWriteCloser) Close() error {
-	return nil
 }
