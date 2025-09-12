@@ -144,12 +144,25 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		// CRITICAL FIX: Send events SYNCHRONOUSLY during normal progress
 		// Only the FINAL events truly need to be async to avoid blocking restore completion
 		// Regular progress events are fast enough to send inline
+		
+		// For S3 backups during archive phase, adjust displayed values to prevent written > total
+		displayWritten := written
+		displayTotal := total
+		if spt.isS3 && spt.archiveSize == 0 {
+			// During archive phase: show progress scaled to 2×total
+			// This matches our percentage calculation logic
+			displayTotal = total * 2
+			if displayWritten > displayTotal {
+				displayWritten = displayTotal // Cap at maximum
+			}
+		}
+		
 		update := BackupProgressUpdate{
 			BackupID:     spt.backupID,
 			Type:         spt.backupType,
 			Percentage:   percentage,
-			BytesWritten: written,
-			BytesTotal:   total,
+			BytesWritten: displayWritten,
+			BytesTotal:   displayTotal,
 		}
 
 		// For FINAL progress, we still use async to not block the restore completion
@@ -258,6 +271,17 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		total = int64(spt.progress.Total())
 	}
 
+	// For S3 backups during archive phase, adjust displayed values to prevent written > total
+	displayWritten := written
+	displayTotal := total
+	if spt.isS3 && spt.archiveSize == 0 {
+		// During archive phase: show progress scaled to 2×total
+		displayTotal = total * 2
+		if displayWritten > displayTotal {
+			displayWritten = displayTotal // Cap at maximum
+		}
+	}
+	
 	spt.server.Log().WithFields(log.Fields{
 		"backup_id":     spt.backupID,
 		"backup_type":   spt.backupType,
@@ -273,8 +297,8 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 		BackupID:     spt.backupID,
 		Type:         spt.backupType,
 		Percentage:   percentage,
-		BytesWritten: written,
-		BytesTotal:   total,
+		BytesWritten: displayWritten,
+		BytesTotal:   displayTotal,
 	}
 
 	// Send final progress SYNCHRONOUSLY - no goroutine!
