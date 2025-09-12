@@ -69,23 +69,22 @@ func (spt *SimpleProgressTracker) CheckProgress() {
 		// S3 SPECIAL CASE: Scale to 80% during archive, then 80-100% during upload
 		if spt.isS3 {
 			if spt.archiveSize == 0 {
-				// Archive phase: written goes from 0 to 2×total
-				// Scale this to 0-80%
-				if written >= total*2 {
+				// Archive phase: scale to 0-80%
+				// Now that total is the full size, written should reach approximately total
+				if written >= total {
 					percentage = 80 // Cap at 80% when archive is done
 				} else {
-					// Scale 0 to 2×total => 0 to 80%
-					percentage = int((written * 80) / (total * 2))
+					// Scale 0 to total => 0 to 80%
+					percentage = int((written * 80) / total)
 				}
 			} else {
-				// Upload phase: written goes from 2×total to 2×total+archiveSize
+				// Upload phase: written goes from total to total+archiveSize
 				// Scale this to 80-100%
-				doubleTotal := total * 2
-				if written <= doubleTotal {
+				if written <= total {
 					percentage = 80 // Still at 80% if upload hasn't started
 				} else {
 					// Upload progress: how much of the archive have we uploaded?
-					uploadBytes := written - doubleTotal
+					uploadBytes := written - total
 					if uploadBytes >= spt.archiveSize {
 						percentage = 100 // Upload complete
 					} else {

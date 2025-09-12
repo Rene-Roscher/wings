@@ -983,24 +983,15 @@ func (s *Server) countBackupEntries(backupPath string) (*fileStats, error) {
 // generateLocalBackupWithProgress creates a local backup with progress tracking and context support
 // UNIFIED BEHAVIOR: Uses same progress pattern as S3 backups for consistency (WORK.md compliance)
 func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.LocalBackup, ignored string, progressInstance *progress.Progress) (*backup.ArchiveDetails, error) {
-	// UNIFIED PROGRESS: Scale progress to match S3 behavior for consistent user experience
-	// This ensures Local and S3 backups behave identically as required by WORK.md
-	if progressInstance != nil {
-		originalTotal := progressInstance.Total()
-		if originalTotal > 0 {
-			// Apply same scaling as S3 backups for consistent behavior
-			// Archive creation = 80% of total, leaving 20% for "finalization"
-			scaledTotal := originalTotal * 10 / 8
-			progressInstance.SetTotal(scaledTotal)
-			s.Log().WithField("original_total", originalTotal).WithField("scaled_total", scaledTotal).Debug("scaled Local backup progress for S3 consistency")
-		}
-	}
+	// UNIFIED PROGRESS: For local backups, no scaling needed anymore
+	// The total is already correctly estimated based on disk usage
+	// Local backups complete when archive is done (no separate upload phase like S3)
 
-	// Phase 1: Create archive (80% of progress)
+	// Create archive (100% of progress for local backups)
 	a := &filesystem.Archive{
 		Filesystem: s.Filesystem(),
 		Ignore:     ignored,
-		Progress:   progressInstance, // Will reach 80% when archive is complete
+		Progress:   progressInstance, // Will reach 100% when archive is complete
 	}
 
 	s.Log().WithField("backup", b.Identifier()).WithField("path", b.Path()).Info("creating backup for server")
@@ -1011,41 +1002,8 @@ func (s *Server) generateLocalBackupWithProgress(ctx context.Context, b *backup.
 
 	// Phase 2: Finalization phase (remaining 20% for consistency with S3)
 	// This ensures identical progress behavior between Local and S3 backups
-	if progressInstance != nil {
-		total := progressInstance.Total()
-		written := progressInstance.Written()
-		remaining := total - written
-		
-		s.Log().WithFields(log.Fields{
-			"total": total,
-			"written": written,
-			"remaining": remaining,
-			"percentage": int((written * 100) / total),
-		}).Debug("Local backup finalization phase starting (for S3 consistency)")
-
-		// Add remaining progress in chunks to match S3 behavior
-		if remaining > 0 {
-			chunkSize := remaining / 10 // 10 updates for remaining 20%
-			chunkSize = max(chunkSize, 1)
-
-			for i := uint64(0); i < remaining; i += chunkSize {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				default:
-				}
-
-				addBytes := chunkSize
-				if i+chunkSize > remaining {
-					addBytes = remaining - i
-				}
-				
-				progressInstance.AddWritten(addBytes)
-				// Small delay to make finalization progress visible (matches S3 behavior)
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-	}
+	// Local backups are done when archive is complete - no finalization needed
+	// The progress should already be at or near 100%
 
 	ad, err := b.Details(s.Context(), nil)
 	if err != nil {
