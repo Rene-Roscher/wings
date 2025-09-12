@@ -161,8 +161,10 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 	// Always try to get a size estimate for percentage calculation
 	var estimatedSize int64
 	if cachedSize > 0 {
-		// Use cached value (instantaneous) with compression estimate
-		estimatedSize = cachedSize / 2 // tar.gz compression ~50%
+		// Use cached value but be conservative with compression estimate
+		// Real-world data: 270MB server -> 255MB backup (only ~5% compression)
+		// Better to overestimate than underestimate for progress tracking
+		estimatedSize = cachedSize // No compression assumption - better safe than sorry
 		s.Log().WithField("estimated_backup_size", estimatedSize).Debug("using cached disk usage for backup progress")
 	} else {
 		// Check context before expensive operation
@@ -211,7 +213,7 @@ func (s *Server) BackupWithContext(ctx context.Context, b backup.BackupInterface
 		select {
 		case result := <-done:
 			if result.err == nil && result.size > 0 {
-				estimatedSize = result.size / 2 // tar.gz compression ~50%
+				estimatedSize = result.size // No compression assumption - better safe than sorry
 				s.Log().WithField("estimated_backup_size", estimatedSize).Debug("calculated fresh disk usage for backup progress")
 			} else {
 				s.Log().WithField("error", result.err).Debug("fresh disk usage calculation failed")
