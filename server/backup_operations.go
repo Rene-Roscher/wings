@@ -36,6 +36,9 @@ type BackupOperation struct {
 	Cancel context.CancelFunc `json:"-"`
 	// StartTime is when the operation started (Unix timestamp)
 	StartTime int64 `json:"start_time"`
+	// CRITICAL FIX: Store semaphore token to prevent leaks
+	// This channel MUST be used to return the token when operation completes
+	semaphoreToken chan struct{} `json:"-"`
 }
 
 // BackupOperationRegistry tracks running backup and restore operations
@@ -108,13 +111,14 @@ func (r *BackupOperationRegistry) Register(parentCtx context.Context, backupID, 
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	operation := &BackupOperation{
-		ID:        operationID,
-		BackupID:  backupID,
-		ServerID:  serverID,
-		Type:      opType,
-		Context:   ctx,
-		Cancel:    cancel,
-		StartTime: time.Now().Unix(),
+		ID:             operationID,
+		BackupID:       backupID,
+		ServerID:       serverID,
+		Type:           opType,
+		Context:        ctx,
+		Cancel:         cancel,
+		StartTime:      time.Now().Unix(),
+		semaphoreToken: semaphore, // CRITICAL FIX: Store token reference
 	}
 
 	// Check if operation already exists (shouldn't happen with proper state management)
@@ -160,22 +164,11 @@ func (r *BackupOperationRegistry) Cancel(backupID string) error {
 	// Cancel the context
 	operation.Cancel()
 
-	// QUEUING: Release semaphore slot when cancelled - NON-BLOCKING safe pattern
-	switch operation.Type {
-	case OperationTypeBackup:
-		select {
-		case <-r.backupSemaphore:
-			r.logger.Debug("released backup semaphore slot after cancellation")
-		default:
-			r.logger.Debug("backup semaphore already drained - normal during high concurrency")
-		}
-	case OperationTypeRestore:
-		select {
-		case <-r.restoreSemaphore:
-			r.logger.Debug("released restore semaphore slot after cancellation")
-		default:
-			r.logger.Debug("restore semaphore already drained - normal during high concurrency")
-		}
+	// CRITICAL FIX: Release semaphore token BLOCKING (prevents leaks)
+	// This MUST be done before deleting the operation
+	if operation.semaphoreToken != nil {
+		<-operation.semaphoreToken // BLOCKING receive to return token
+		r.logger.Debug("released semaphore slot after cancellation")
 	}
 
 	// Remove from registry
@@ -221,22 +214,10 @@ func (r *BackupOperationRegistry) Complete(backupID string) {
 			"type":         operation.Type,
 		}).Info("backup operation completed")
 
-		// QUEUING: Release semaphore slot so next operation can proceed - NON-BLOCKING safe pattern
-		switch operation.Type {
-		case OperationTypeBackup:
-			select {
-			case <-r.backupSemaphore:
-				r.logger.Debug("released backup semaphore slot")
-			default:
-				r.logger.Debug("backup semaphore already drained - normal during high concurrency")
-			}
-		case OperationTypeRestore:
-			select {
-			case <-r.restoreSemaphore:
-				r.logger.Debug("released restore semaphore slot")
-			default:
-				r.logger.Debug("restore semaphore already drained - normal during high concurrency")
-			}
+		// CRITICAL FIX: Release semaphore token BLOCKING (prevents leaks)
+		if operation.semaphoreToken != nil {
+			<-operation.semaphoreToken // BLOCKING receive to return token
+			r.logger.Debug("released semaphore slot after completion")
 		}
 
 		delete(r.operations, backupID)
@@ -317,25 +298,13 @@ func (r *BackupOperationRegistry) CleanupStaleOperations(maxDuration time.Durati
 
 			// Cancel the stale operation
 			operation.Cancel()
-			
-			// CRITICAL: Release semaphore slot to prevent leaks during cleanup - NON-BLOCKING safe pattern
-			switch operation.Type {
-			case OperationTypeBackup:
-				select {
-				case <-r.backupSemaphore:
-					r.logger.Debug("released backup semaphore slot during cleanup")
-				default:
-					r.logger.Debug("backup semaphore already drained - normal during cleanup")
-				}
-			case OperationTypeRestore:
-				select {
-				case <-r.restoreSemaphore:
-					r.logger.Debug("released restore semaphore slot during cleanup")
-				default:
-					r.logger.Debug("restore semaphore already drained - normal during cleanup")
-				}
+
+			// CRITICAL FIX: Release semaphore token BLOCKING (prevents leaks)
+			if operation.semaphoreToken != nil {
+				<-operation.semaphoreToken // BLOCKING receive to return token
+				r.logger.Debug("released semaphore slot during cleanup")
 			}
-			
+
 			delete(r.operations, backupID)
 		}
 	}
@@ -369,22 +338,10 @@ func (r *BackupOperationRegistry) CancelAllForServer(serverID string) error {
 			// Cancel the context
 			operation.Cancel()
 			
-			// CRITICAL: Release semaphore slot to prevent leaks during server deletion - NON-BLOCKING safe pattern
-			switch operation.Type {
-			case OperationTypeBackup:
-				select {
-				case <-r.backupSemaphore:
-					r.logger.Debug("released backup semaphore slot for server deletion")
-				default:
-					r.logger.Debug("backup semaphore already drained - normal during server deletion")
-				}
-			case OperationTypeRestore:
-				select {
-				case <-r.restoreSemaphore:
-					r.logger.Debug("released restore semaphore slot for server deletion")
-				default:
-					r.logger.Debug("restore semaphore already drained - normal during server deletion")
-				}
+			// CRITICAL FIX: Release semaphore token BLOCKING (prevents leaks)
+			if operation.semaphoreToken != nil {
+				<-operation.semaphoreToken // BLOCKING receive to return token
+				r.logger.Debug("released semaphore slot for server deletion")
 			}
 			
 			// Remove from registry

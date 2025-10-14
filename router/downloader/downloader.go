@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 	"github.com/google/uuid"
 
 	"github.com/Rene-Roscher/wings/server"
@@ -99,7 +100,12 @@ const (
 	ErrInternalResolution = errors.Sentinel("downloader: destination resolves to internal network location")
 	ErrInvalidIPAddress   = errors.Sentinel("downloader: invalid IP address")
 	ErrDownloadFailed     = errors.Sentinel("downloader: download request failed")
+	ErrInvalidFilename    = errors.Sentinel("downloader: invalid or unsafe filename")
+	ErrFileTooLarge       = errors.Sentinel("downloader: file exceeds maximum allowed size")
 )
+
+// Maximum download size: 15GB (configurable if needed)
+const maxDownloadSize = 15 * 1024 * 1024 * 1024
 
 type Counter struct {
 	total   int
@@ -174,6 +180,64 @@ func (dl Download) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// sanitizeFilename prevents path traversal attacks by cleaning and validating filenames
+// SECURITY: This function is CRITICAL for preventing RCE via path traversal
+func sanitizeFilename(filename string) (string, error) {
+	if filename == "" {
+		return "", ErrInvalidFilename
+	}
+
+	// Use filepath.Base to remove any directory components (prevents ../ attacks)
+	clean := filepath.Base(filename)
+
+	// Additional validation: Base() alone is not enough for edge cases
+	// Check for dangerous patterns that might bypass Base()
+	if clean == "." || clean == ".." {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	// Reject absolute paths (should already be handled by Base, but defense in depth)
+	if filepath.IsAbs(filename) {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	// Reject filenames that still contain path separators after Base()
+	// This catches edge cases on different operating systems
+	if strings.ContainsAny(clean, "/\\") {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	// Reject hidden files and system files (optional, but good security practice)
+	if strings.HasPrefix(clean, ".") {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	// Validate length (prevent extremely long filenames)
+	if len(clean) > 255 {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	// Whitelist approach: only allow alphanumeric, dash, underscore, and single dot
+	// This prevents special characters that might be exploited
+	for i, c := range clean {
+		valid := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.'
+
+		if !valid {
+			return "", errors.Wrap(ErrInvalidFilename, fmt.Sprintf("invalid character at position %d: %c", i, c))
+		}
+	}
+
+	// Prevent multiple dots in a row (could be used for obfuscation)
+	if strings.Contains(clean, "..") {
+		return "", errors.WithStack(ErrInvalidFilename)
+	}
+
+	return clean, nil
+}
+
 // Execute executes a given download for the server and begins writing the file to the disk. Once
 // completed the download will be removed from the cache.
 func (dl *Download) Execute() error {
@@ -203,6 +267,14 @@ func (dl *Download) Execute() error {
 		return errors.New("downloader: request is missing ContentLength")
 	}
 
+	// SECURITY: Check maximum file size to prevent DoS via disk exhaustion
+	if res.ContentLength > maxDownloadSize {
+		return errors.Wrap(ErrFileTooLarge, fmt.Sprintf("file size %d bytes exceeds maximum %d bytes", res.ContentLength, maxDownloadSize))
+	}
+
+	// SECURITY: Extract filename from various sources and sanitize ALL of them
+	var unsafeFilename string
+
 	if dl.req.UseHeader {
 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
 			_, params, err := mime.ParseMediaType(contentDisposition)
@@ -211,18 +283,33 @@ func (dl *Download) Execute() error {
 			}
 
 			if v, ok := params["filename"]; ok {
-				dl.path = v
+				// SECURITY FIX: Sanitize Content-Disposition filename (Attack Vector #1)
+				unsafeFilename = v
 			}
 		}
 	}
-	if dl.path == "" {
+	if unsafeFilename == "" {
 		if dl.req.FileName != "" {
-			dl.path = dl.req.FileName
+			// SECURITY FIX: Sanitize user-provided filename (Attack Vector #2)
+			unsafeFilename = dl.req.FileName
 		} else {
+			// SECURITY FIX: Sanitize URL path filename (Attack Vector #3)
 			parts := strings.Split(dl.req.URL.Path, "/")
-			dl.path = parts[len(parts)-1]
+			unsafeFilename = parts[len(parts)-1]
 		}
 	}
+
+	// CRITICAL SECURITY: Sanitize filename to prevent path traversal
+	safeFilename, err := sanitizeFilename(unsafeFilename)
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("downloader: unsafe filename rejected: %s", unsafeFilename))
+	}
+
+	dl.path = safeFilename
+	dl.server.Log().WithFields(log.Fields{
+		"unsafe_filename": unsafeFilename,
+		"safe_filename":   safeFilename,
+	}).Debug("sanitized download filename")
 
 	p := dl.Path()
 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
