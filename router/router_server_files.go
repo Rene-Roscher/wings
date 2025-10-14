@@ -349,6 +349,11 @@ func postServerPullRemoteFile(c *gin.Context) {
 		UseHeader: data.UseHeader,
 	})
 
+	// Enable WebSocket progress events for background downloads
+	if !data.Foreground {
+		dl.EnableEvents()
+	}
+
 	download := func() error {
 		s.Log().WithField("download_id", dl.Identifier).WithField("url", u.String()).Info("starting pull of remote file to disk")
 		if err := dl.Execute(); err != nil {
@@ -369,6 +374,9 @@ func postServerPullRemoteFile(c *gin.Context) {
 		}()
 		c.JSON(http.StatusAccepted, gin.H{
 			"identifier": dl.Identifier,
+			"filename":   data.FileName, // Will be sanitized, client gets initial info
+			"directory":  data.RootPath,
+			"url":        data.URL,
 		})
 		return
 	}

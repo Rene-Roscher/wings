@@ -119,6 +119,18 @@ func (c *Counter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// DownloadProgressUpdate represents the data sent over WebSocket for download progress
+type DownloadProgressUpdate struct {
+	Identifier   string `json:"identifier"`
+	Filename     string `json:"filename"`
+	Directory    string `json:"directory"`
+	URL          string `json:"url"`
+	Percentage   int    `json:"percentage"`
+	BytesWritten int64  `json:"bytes_written"`
+	BytesTotal   int64  `json:"bytes_total"`
+	Status       string `json:"status"` // "downloading", "completed", "failed"
+}
+
 type DownloadRequest struct {
 	Directory string
 	URL       *url.URL
@@ -134,6 +146,10 @@ type Download struct {
 	server     *server.Server
 	progress   float64
 	cancelFunc *context.CancelFunc
+	// WebSocket progress tracking (only enabled for background downloads)
+	sendEvents     bool
+	lastEventTime  int64 // Unix nano for throttling
+	lastPercentage int   // Last percentage sent
 }
 
 // New starts a new tracked download which allows for cancellation later on by calling
@@ -146,6 +162,14 @@ func New(s *server.Server, r DownloadRequest) *Download {
 	}
 	instance.track(&dl)
 	return &dl
+}
+
+// EnableEvents enables WebSocket progress events for background downloads
+// Should only be called for foreground=false downloads
+func (dl *Download) EnableEvents() {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	dl.sendEvents = true
 }
 
 // ByServer returns all the tracked downloads for a given server instance.
@@ -245,31 +269,103 @@ func (dl *Download) Execute() error {
 	dl.cancelFunc = &cancel
 	defer dl.Cancel()
 
-	// At this point we have verified the destination is not within the local network, so we can
-	// now make a request to that URL and pull down the file, saving it to the server's data
-	// directory.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dl.req.URL.String(), nil)
-	if err != nil {
-		return errors.WrapIf(err, "downloader: failed to create request")
+	// SECURITY: Follow redirects manually to ensure each redirect target goes through SSRF validation
+	// Our DialContext checks prevent redirects to internal networks (127.0.0.1, 10.0.0.0/8, etc)
+	const maxRedirects = 10
+	currentURL := dl.req.URL.String()
+
+	var res *http.Response
+	var err error
+
+	for redirectCount := 0; redirectCount <= maxRedirects; redirectCount++ {
+		// Create request for current URL (goes through SSRF-protected DialContext)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
+		if err != nil {
+			return errors.WrapIf(err, "downloader: failed to create request")
+		}
+		req.Header.Set("User-Agent", "Pterodactyl Panel (https://pterodactyl.io)")
+
+		// Execute request
+		res, err = client.Do(req)
+		if err != nil {
+			return ErrDownloadFailed
+		}
+
+		// Check if this is a redirect (3xx status codes)
+		if res.StatusCode >= 300 && res.StatusCode < 400 {
+			location := res.Header.Get("Location")
+			if location == "" {
+				res.Body.Close()
+				return errors.New("downloader: redirect response missing Location header")
+			}
+
+			// Parse redirect URL (may be relative)
+			redirectURL, err := url.Parse(location)
+			if err != nil {
+				res.Body.Close()
+				return errors.Wrap(err, "downloader: invalid redirect Location")
+			}
+
+			// Resolve against current URL (handles relative redirects like /path)
+			redirectURL = req.URL.ResolveReference(redirectURL)
+
+			// Log redirect for debugging
+			dl.server.Log().WithFields(log.Fields{
+				"from":   currentURL,
+				"to":     redirectURL.String(),
+				"status": res.StatusCode,
+				"count":  redirectCount + 1,
+			}).Debug("following redirect")
+
+			// Close body (no content in redirect responses)
+			res.Body.Close()
+
+			// Check redirect limit
+			if redirectCount >= maxRedirects {
+				return errors.New(fmt.Sprintf("downloader: too many redirects (max %d)", maxRedirects))
+			}
+
+			// Update URL for next iteration
+			currentURL = redirectURL.String()
+			continue
+		}
+
+		// Not a redirect - check for success
+		if res.StatusCode != http.StatusOK {
+			res.Body.Close()
+			return errors.New("downloader: got bad response status from endpoint: " + res.Status)
+		}
+
+		// Success! Break out of redirect loop
+		break
 	}
 
-	req.Header.Set("User-Agent", "Pterodactyl Panel (https://pterodactyl.io)")
-	res, err := client.Do(req)
-	if err != nil {
-		return ErrDownloadFailed
+	// Ensure we have a response body to work with
+	if res == nil {
+		return errors.New("downloader: no response received")
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
-	}
 
-	if res.ContentLength < 1 {
-		return errors.New("downloader: request is missing ContentLength")
+	// Check ContentLength:
+	// - ContentLength > 0: known size
+	// - ContentLength == -1: unknown size (chunked encoding) - ALLOWED
+	// - ContentLength == 0: empty file - REJECTED
+	hasKnownSize := res.ContentLength > 0
+	if res.ContentLength == 0 {
+		return errors.New("downloader: remote file is empty (ContentLength is 0)")
 	}
 
 	// SECURITY: Check maximum file size to prevent DoS via disk exhaustion
-	if res.ContentLength > maxDownloadSize {
+	// Only possible if we have a known size
+	if hasKnownSize && res.ContentLength > maxDownloadSize {
 		return errors.Wrap(ErrFileTooLarge, fmt.Sprintf("file size %d bytes exceeds maximum %d bytes", res.ContentLength, maxDownloadSize))
+	}
+
+	// Log download mode for debugging
+	if hasKnownSize {
+		dl.server.Log().WithField("content_length", res.ContentLength).Debug("downloading file with known size")
+	} else {
+		dl.server.Log().Warn("downloading file with unknown size (chunked encoding) - progress tracking will show bytes only")
 	}
 
 	// SECURITY: Extract filename from various sources and sanitize ALL of them
@@ -311,6 +407,43 @@ func (dl *Download) Execute() error {
 		"safe_filename":   safeFilename,
 	}).Debug("sanitized download filename")
 
+	// Send initial WebSocket event (if enabled for background downloads)
+	if dl.sendEvents {
+		dl.mu.Lock()
+		dl.sendProgressEvent(0, 0, res.ContentLength, "downloading")
+		dl.mu.Unlock()
+	}
+
+	// CRITICAL: Defer final event sending (executes at function exit)
+	// Capture error at execution time, not declaration time!
+	defer func() {
+		if dl.sendEvents {
+			dl.mu.Lock()
+			defer dl.mu.Unlock()
+
+			// Determine status based on err (captured at defer execution)
+			var finalStatus string
+			var finalPercentage int
+			if err == nil {
+				finalStatus = "completed"
+				finalPercentage = 100
+			} else {
+				finalStatus = "failed"
+				finalPercentage = -1 // Error indicator
+			}
+
+			// Get final bytes written (from progress)
+			var bytesWritten int64
+			if res.ContentLength > 0 {
+				bytesWritten = int64(dl.progress * float64(res.ContentLength))
+			} else {
+				bytesWritten = int64(dl.progress) // Raw bytes for chunked
+			}
+
+			dl.sendProgressEvent(finalPercentage, bytesWritten, res.ContentLength, finalStatus)
+		}
+	}()
+
 	p := dl.Path()
 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
 
@@ -351,15 +484,68 @@ func (dl *Download) Path() string {
 
 // Handles a write event by updating the progress completed percentage and firing off
 // events to the server websocket as needed.
+// For chunked encoding (contentLength == -1), progress will be reported as bytes downloaded.
 func (dl *Download) counter(contentLength int64) *Counter {
 	onWrite := func(t int) {
 		dl.mu.Lock()
 		defer dl.mu.Unlock()
-		dl.progress = float64(t) / float64(contentLength)
+
+		var percentage int
+		if contentLength > 0 {
+			// Known size: calculate percentage
+			dl.progress = float64(t) / float64(contentLength)
+			percentage = int(dl.progress * 100)
+			if percentage > 100 {
+				percentage = 100
+			}
+		} else {
+			// Unknown size (chunked encoding): report bytes as "progress"
+			dl.progress = float64(t)
+			percentage = 0 // Can't calculate percentage without total
+		}
+
+		// Send WebSocket progress events (if enabled, with throttling)
+		if dl.sendEvents {
+			dl.sendProgressEvent(percentage, int64(t), contentLength, "downloading")
+		}
 	}
 	return &Counter{
 		onWrite: onWrite,
 	}
+}
+
+// sendProgressEvent sends a WebSocket event with throttling (250ms between updates)
+// MUST be called with dl.mu held (Lock or RLock)
+func (dl *Download) sendProgressEvent(percentage int, bytesWritten, bytesTotal int64, status string) {
+	now := time.Now().UnixNano()
+
+	// Throttle: Only send events every 250ms (like backup progress)
+	// ALWAYS send: 0%, 100%, or status change
+	const throttleNanos = 250_000_000 // 250ms
+	shouldSend := (now - dl.lastEventTime) >= throttleNanos ||
+		percentage != dl.lastPercentage ||
+		status != "downloading"
+
+	if !shouldSend {
+		return
+	}
+
+	dl.lastEventTime = now
+	dl.lastPercentage = percentage
+
+	event := DownloadProgressUpdate{
+		Identifier:   dl.Identifier,
+		Filename:     dl.path,
+		Directory:    dl.req.Directory,
+		URL:          dl.req.URL.String(),
+		Percentage:   percentage,
+		BytesWritten: bytesWritten,
+		BytesTotal:   bytesTotal,
+		Status:       status,
+	}
+
+	// Import server package for DownloadProgressEvent constant
+	dl.server.Events().Publish("download progress", event)
 }
 
 // Downloader represents a global downloader that keeps track of all currently processing downloads
