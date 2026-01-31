@@ -21,9 +21,9 @@ func TestDetectCompressionFormat(t *testing.T) {
 			expectedFormat: CompressionGzip,
 		},
 		{
-			name:           "ZSTD format",
+			name:           "ZSTD format (no longer supported, falls back to GZIP)",
 			data:           []byte{0x28, 0xB5, 0x2F, 0xFD}, // ZSTD magic
-			expectedFormat: CompressionZstd,
+			expectedFormat: CompressionGzip,                 // Falls back to GZIP since ZSTD is not supported
 		},
 		{
 			name:           "Unknown format defaults to GZIP",
@@ -79,7 +79,7 @@ func TestCreateDecompressor(t *testing.T) {
 		}
 	})
 
-	// Test ZSTD decompressor
+	// Test ZSTD decompressor (should fail as ZSTD is no longer supported)
 	t.Run("ZSTD decompressor", func(t *testing.T) {
 		var buf bytes.Buffer
 		zw, err := zstd.NewWriter(&buf)
@@ -94,20 +94,20 @@ func TestCreateDecompressor(t *testing.T) {
 
 		reader := io.NopCloser(bytes.NewReader(buf.Bytes()))
 		decompressor, err := CreateDecompressor(reader, CompressionZstd)
-		if err != nil {
-			t.Errorf("CreateDecompressor() error = %v", err)
-			return
-		}
-		defer decompressor.Close()
 
-		data, err := io.ReadAll(decompressor)
-		if err != nil {
-			t.Errorf("Failed to read from ZSTD decompressor: %v", err)
+		// ZSTD is no longer supported, should return an error
+		if err == nil {
+			if decompressor != nil {
+				decompressor.Close()
+			}
+			t.Error("CreateDecompressor() should return error for ZSTD format (no longer supported)")
 			return
 		}
 
-		if string(data) != "test data" {
-			t.Errorf("ZSTD decompression failed: got %s, want 'test data'", string(data))
+		// Verify the error message contains expected text
+		expectedErrMsg := "ZSTD compression is no longer supported"
+		if !bytes.Contains([]byte(err.Error()), []byte(expectedErrMsg)) {
+			t.Errorf("CreateDecompressor() error = %v, should contain %q", err, expectedErrMsg)
 		}
 	})
 }

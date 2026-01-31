@@ -13,7 +13,23 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Rene-Roscher/wings/config"
 )
+
+func init() {
+	// Initialize config for tests to prevent nil pointer dereference
+	tmpDir := os.TempDir()
+	config.Set(&config.Configuration{
+		AuthenticationToken: "test-token",
+		System: config.SystemConfiguration{
+			BackupDirectory: tmpDir,
+			Backups: config.BackupsConfiguration{
+				WriteLimit: 0, // No write limit for tests
+			},
+		},
+	})
+}
 
 // TestS3RestoreDirectoryHandling tests that S3 restore can handle directories correctly
 func TestS3RestoreDirectoryHandling(t *testing.T) {
