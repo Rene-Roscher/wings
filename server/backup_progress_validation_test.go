@@ -63,7 +63,7 @@ func TestProgressTrackerThrottling(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(1000)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "throttle-test", "s3", prog)
 	defer tracker.Close()
 
@@ -98,7 +98,7 @@ func TestProgressTrackerFinalProgress(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "final-test", "s3", prog)
 	defer tracker.Close()
 
@@ -123,7 +123,7 @@ func TestProgressTrackerFinalProgressFailure(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "failure-test", "local", prog)
 	defer tracker.Close()
 
@@ -148,7 +148,7 @@ func TestProgressTrackerContextCancellation(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "cancel-test", "s3", prog)
 
 	// Make some progress
@@ -186,7 +186,7 @@ func TestProgressTrackerByteMode(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	// Don't set total - simulates unknown backup size
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "byte-test", "s3", prog)
 	defer tracker.Close()
 
@@ -212,7 +212,7 @@ func TestProgressTrackerResourceCleanup(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "cleanup-test", "local", prog)
 
 	// Make progress to spawn some goroutines
@@ -285,7 +285,7 @@ func TestProgressTrackerPerformance(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(1000000) // 1M total
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "perf-test", "local", prog)
 	defer tracker.Close()
 
