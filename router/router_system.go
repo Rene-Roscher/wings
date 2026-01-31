@@ -8,7 +8,7 @@ import (
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
-	"github.com/pterodactyl/wings/router/tokens"
+	"github.com/Rene-Roscher/wings/router/tokens"
 
 	"github.com/Rene-Roscher/wings/config"
 	"github.com/Rene-Roscher/wings/router/middleware"

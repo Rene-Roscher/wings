@@ -1,7 +1,7 @@
 package server
 
 import (
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Sftp returns the SFTP connection bag for the server instance. This bag tracks
