@@ -24,7 +24,7 @@ func init() {
 		AuthenticationToken: "test-token",
 		System: config.SystemConfiguration{
 			BackupDirectory: tmpDir,
-			Backups: config.BackupsConfiguration{
+			Backups: config.Backups{
 				WriteLimit: 0, // No write limit for tests
 			},
 		},

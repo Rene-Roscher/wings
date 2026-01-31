@@ -9,7 +9,18 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/Rene-Roscher/wings/internal/progress"
+	"github.com/Rene-Roscher/wings/system"
 )
+
+// newMockServer creates a minimal Server instance for testing
+func newMockServer() *Server {
+	return &Server{
+		installing:   system.NewAtomicBool(false),
+		transferring: system.NewAtomicBool(false),
+		restoring:    system.NewAtomicBool(false),
+		backingUp:    system.NewAtomicBool(false),
+	}
+}
 
 // TestSimpleProgressTrackerBasics tests core progress tracking functionality
 func TestSimpleProgressTrackerBasics(t *testing.T) {
@@ -22,7 +33,7 @@ func TestSimpleProgressTrackerBasics(t *testing.T) {
 	prog.SetTotal(100)
 
 	// Create test server (minimal mock)
-	mockServer := &Server{}
+	mockServer := newMockServer()
 
 	// Create progress tracker
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "test-backup-123", "local", prog)
