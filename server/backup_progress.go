@@ -289,6 +289,9 @@ func (spt *SimpleProgressTracker) SendFinalProgress(success bool) {
 	
 	// Send the final event directly - this is fast enough
 	spt.server.Events().Publish(BackupProgressEvent, update)
-	
+
+	// Update lastSent to reflect final progress
+	atomic.StoreInt64(&spt.lastSent, int64(percentage))
+
 	// NO MORE GOROUTINES HERE! The caller will handle Close()
 }
