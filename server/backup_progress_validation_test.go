@@ -8,9 +8,37 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/events"
 	"github.com/Rene-Roscher/wings/internal/progress"
 	"github.com/Rene-Roscher/wings/system"
 )
+
+// mockEnvironment is a minimal mock implementation for testing
+type mockEnvironment struct{}
+
+func (m *mockEnvironment) Type() string { return "mock" }
+func (m *mockEnvironment) Config() *environment.Configuration { return nil }
+func (m *mockEnvironment) Events() *events.Bus { return events.NewBus() }
+func (m *mockEnvironment) Exists() (bool, error) { return true, nil }
+func (m *mockEnvironment) IsRunning(ctx context.Context) (bool, error) { return false, nil }
+func (m *mockEnvironment) InSituUpdate() error { return nil }
+func (m *mockEnvironment) OnBeforeStart(ctx context.Context) error { return nil }
+func (m *mockEnvironment) Start(ctx context.Context) error { return nil }
+func (m *mockEnvironment) Stop(ctx context.Context) error { return nil }
+func (m *mockEnvironment) WaitForStop(ctx context.Context, duration time.Duration, terminate bool) error { return nil }
+func (m *mockEnvironment) Terminate(ctx context.Context, signal string) error { return nil }
+func (m *mockEnvironment) Destroy() error { return nil }
+func (m *mockEnvironment) ExitState() (uint32, bool, error) { return 0, false, nil }
+func (m *mockEnvironment) Create() error { return nil }
+func (m *mockEnvironment) Attach(ctx context.Context) error { return nil }
+func (m *mockEnvironment) SendCommand(string) error { return nil }
+func (m *mockEnvironment) Readlog(int) ([]string, error) { return nil, nil }
+func (m *mockEnvironment) State() string { return "offline" }
+func (m *mockEnvironment) SetState(string) {}
+func (m *mockEnvironment) Uptime(ctx context.Context) (int64, error) { return 0, nil }
+func (m *mockEnvironment) SetLogCallback(func([]byte)) {}
+func (m *mockEnvironment) SetStream(bool) {}
 
 // newMockServer creates a minimal Server instance for testing
 func newMockServer() *Server {
@@ -19,6 +47,7 @@ func newMockServer() *Server {
 		transferring: system.NewAtomicBool(false),
 		restoring:    system.NewAtomicBool(false),
 		backingUp:    system.NewAtomicBool(false),
+		Environment:  &mockEnvironment{},
 	}
 }
 

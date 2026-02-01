@@ -3,7 +3,6 @@ package backup
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"io"
 	"os"
