@@ -52,3 +52,7 @@ debug
 *.pprof
 *.pdf
 pprof.*
+
+.claude-flow/
+.hive-mind/
+CLAUDE.md

@@ -12,9 +12,9 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/server"
-	"github.com/pterodactyl/wings/server/filesystem"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/server"
+	"github.com/Rene-Roscher/wings/server/filesystem"
 )
 
 const (
@@ -44,9 +44,10 @@ func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
 	}
 
 	events := eventHandler{
-		ip:     sc.RemoteAddr().String(),
-		user:   uuid,
-		server: srv.ID(),
+		ip:        sc.RemoteAddr().String(),
+		user:      uuid,
+		server:    srv.ID(),
+		publisher: srv, // Server implements EventPublisher interface
 	}
 
 	return &Handler{
@@ -300,4 +301,8 @@ func (h *Handler) can(permission string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) User() string {
+	return h.events.user
 }

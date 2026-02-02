@@ -25,7 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
 
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 const DefaultLocation = "/etc/pterodactyl/config.yml"
@@ -69,6 +69,60 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	
+	// Smart brute force protection configuration
+	Security SftpSecurityConfiguration `yaml:"security"`
+}
+
+// SftpSecurityConfiguration defines intelligent brute force protection settings
+type SftpSecurityConfiguration struct {
+	// Enable/disable brute force protection
+	Enabled bool `default:"true" yaml:"enabled"`
+	
+	// Base thresholds for triggering blocks
+	Thresholds SftpSecurityThresholds `yaml:"thresholds"`
+	
+	// Block duration strategy
+	Blocking SftpBlockingStrategy `yaml:"blocking"`
+	
+	// Reputation system settings
+	Reputation SftpReputationConfig `yaml:"reputation"`
+}
+
+// SftpSecurityThresholds defines when to start blocking
+type SftpSecurityThresholds struct {
+	// Attempts per minute before first block (smart: 6+ = 5min)
+	AttemptsPerMinute int `default:"6" yaml:"attempts_per_minute"`
+	// Attempts per hour before escalated blocking
+	AttemptsPerHour int `default:"15" yaml:"attempts_per_hour"`
+	// Attempts per day before long-term reputation impact
+	AttemptsPerDay int `default:"50" yaml:"attempts_per_day"`
+}
+
+// SftpBlockingStrategy defines how blocks escalate intelligently
+type SftpBlockingStrategy struct {
+	// Base block duration in minutes (smart: starts at 5min)
+	BaseBlockMinutes int `default:"5" yaml:"base_block_minutes"`
+	// Exponential multiplier for repeat offenders (smart: 2x each time)
+	EscalationFactor float64 `default:"2.0" yaml:"escalation_factor"`
+	// Maximum block duration in hours (smart: caps at reasonable limit)
+	MaxBlockHours int `default:"24" yaml:"max_block_hours"`
+	// Decay factor - how much blocks reduce over time (smart: forgiveness)
+	DecayFactor float64 `default:"0.8" yaml:"decay_factor"`
+}
+
+// SftpReputationConfig defines IP reputation tracking
+type SftpReputationConfig struct {
+	// Track reputation history
+	Enabled bool `default:"true" yaml:"enabled"`
+	// Days to remember IP behavior
+	MemoryDays int `default:"7" yaml:"memory_days"`
+	// Score threshold for immediate blocking (-100 to +100)
+	BlockThreshold int `default:"-50" yaml:"block_threshold"`
+	// Good behavior bonus (successful logins)
+	GoodBehaviorBonus int `default:"5" yaml:"good_behavior_bonus"`
+	// Bad behavior penalty (failed attempts)
+	BadBehaviorPenalty int `default:"-10" yaml:"bad_behavior_penalty"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -177,11 +231,11 @@ type SystemConfiguration struct {
 	Passwd struct {
 		// Enable controls whether generated passwd files should be mounted into containers.
 		//
-		// By default this option is disabled and Wings will not mount any additional passwd
-		// files into containers.
+		// By default this option is disabled and Wings will not mount any
+		// additional passwd files into containers.
 		Enable bool `yaml:"enabled" default:"false"`
 
-		// Directory is the directory on disk where the generated files will be stored.
+		// Directory is the directory on disk where the generated passwd files will be stored.
 		// This directory may be temporary as it will be re-created whenever Wings is started.
 		//
 		// This path **WILL** be both written to by Wings and mounted into containers created by
@@ -191,6 +245,26 @@ type SystemConfiguration struct {
 		// correct SELinux context in order for containers to use it.
 		Directory string `yaml:"directory" default:"/run/wings/etc"`
 	} `yaml:"passwd"`
+
+	// MachineID controls the mounting of a generated `/etc/machine-id` file into containers started by Wings.
+	MachineID struct {
+		// Enable controls whether a generated machine-id file should be mounted
+		// into containers.
+		//
+		// By default this option is enabled and Wings will mount an additional
+		// machine-id file into containers.
+		Enable bool `yaml:"enabled" default:"true"`
+
+		// Directory is the directory on disk where the generated machine-id files will be stored.
+		// This directory may be temporary as it will be re-created whenever Wings is started.
+		//
+		// This path **WILL** be both written to by Wings and mounted into containers created by
+		// Wings. If you are running Wings itself in a container, this path will need to be mounted
+		// into the Wings container as the exact path on the host, which should match the value
+		// specified here. If you are using SELinux, you will need to make sure this file has the
+		// correct SELinux context in order for containers to use it.
+		Directory string `yaml:"directory" default:"/run/wings/machine-id"`
+	} `yaml:"machine_id"`
 
 	// The amount of time in seconds that can elapse before a server's disk space calculation is
 	// considered stale and a re-check should occur. DANGER: setting this value too low can seriously
@@ -269,6 +343,15 @@ type Backups struct {
 	//
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
+
+	// Format determines the compression format used for backups.
+	// Available options: "gzip" (default), "zstd"
+	//
+	// zstd provides better compression ratios and faster compression/decompression
+	// compared to gzip, while maintaining full backward compatibility.
+	//
+	// Defaults to "gzip" for backward compatibility
+	Format string `default:"gzip" yaml:"format"`
 }
 
 type Transfers struct {
@@ -634,6 +717,11 @@ func ConfigureDirectories() error {
 		return err
 	}
 
+	log.WithField("path", _config.System.TmpDirectory).Debug("ensuring temporary data directory exists")
+	if err := os.MkdirAll(_config.System.TmpDirectory, 0o700); err != nil {
+		return err
+	}
+
 	log.WithField("path", _config.System.ArchiveDirectory).Debug("ensuring archive data directory exists")
 	if err := os.MkdirAll(_config.System.ArchiveDirectory, 0o700); err != nil {
 		return err
@@ -647,6 +735,13 @@ func ConfigureDirectories() error {
 	if _config.System.Passwd.Enable {
 		log.WithField("path", _config.System.Passwd.Directory).Debug("ensuring passwd directory exists")
 		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil {
+			return err
+		}
+	}
+
+	if _config.System.MachineID.Enable {
+		log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
+		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil {
 			return err
 		}
 	}

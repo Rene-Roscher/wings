@@ -1,5 +1,5 @@
 # Stage 1 (Build)
-FROM golang:1.23.7-alpine AS builder
+FROM golang:1.24.11-alpine AS builder
 
 ARG VERSION
 RUN apk add --update --no-cache git make mailcap
@@ -8,7 +8,7 @@ COPY go.mod go.sum /app/
 RUN go mod download
 COPY . /app/
 RUN CGO_ENABLED=0 go build \
-    -ldflags="-s -w -X github.com/pterodactyl/wings/system.Version=$VERSION" \
+    -ldflags="-s -w -X github.com/Rene-Roscher/wings/system.Version=$VERSION" \
     -v \
     -trimpath \
     -o wings \

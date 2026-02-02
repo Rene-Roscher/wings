@@ -5,10 +5,10 @@ import (
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/router/middleware"
-	wserver "github.com/pterodactyl/wings/server"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/router/middleware"
+	wserver "github.com/Rene-Roscher/wings/server"
 )
 
 // Configure configures the routing infrastructure for this daemon instance.
@@ -62,6 +62,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	protected.GET("/api/servers", getAllServers)
 	protected.POST("/api/servers", postCreateServer)
 	protected.DELETE("/api/transfers/:server", deleteTransfer)
+	protected.POST("/api/deauthorize-user", postDeauthorizeUser)
 
 	// These are server specific routes, and require that the request be authorized, and
 	// that the server exist on the Daemon.
@@ -104,9 +105,11 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 
 		backup := server.Group("/backup")
 		{
+			backup.GET("/operations", getServerBackupOperations)
 			backup.POST("", postServerBackup)
 			backup.POST("/:backup/restore", postServerRestoreBackup)
 			backup.DELETE("/:backup", deleteServerBackup)
+			backup.DELETE("/:backup/cancel", cancelServerBackup)
 		}
 	}
 

@@ -8,10 +8,10 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/pterodactyl/wings/events"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/events"
+	"github.com/Rene-Roscher/wings/system"
 
-	"github.com/pterodactyl/wings/server"
+	"github.com/Rene-Roscher/wings/server"
 )
 
 // RegisterListenerEvents will setup the server event listeners and expiration
@@ -75,6 +75,7 @@ var e = []string{
 	server.InstallCompletedEvent,
 	server.DaemonMessageEvent,
 	server.BackupCompletedEvent,
+	server.BackupProgressEvent,
 	server.BackupRestoreCompletedEvent,
 	server.TransferLogsEvent,
 	server.TransferStatusEvent,
@@ -131,7 +132,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 				continue
 			}
 			var sendErr error
-			message := Message{Event: e.Topic}
+			message := Message{Event: Event(e.Topic)}
 			if str, ok := e.Data.(string); ok {
 				message.Args = []string{str}
 			} else if b, ok := e.Data.([]byte); ok {
@@ -149,7 +150,7 @@ func (h *Handler) listenForServerEvents(ctx context.Context) error {
 					continue
 				}
 			}
-			onError(message.Event, sendErr)
+			onError(string(message.Event), sendErr)
 		}
 		break
 	}

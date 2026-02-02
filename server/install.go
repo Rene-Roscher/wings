@@ -18,10 +18,10 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Install executes the installation stack for a server process. Bubbles any
@@ -157,6 +157,14 @@ func (s *Server) IsRestoring() bool {
 
 func (s *Server) SetRestoring(state bool) {
 	s.restoring.Store(state)
+}
+
+func (s *Server) IsBackingUp() bool {
+	return s.backingUp.Load()
+}
+
+func (s *Server) SetBackingUp(state bool) {
+	s.backingUp.Store(state)
 }
 
 // RemoveContainer removes the installation container for the server.

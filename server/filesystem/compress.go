@@ -15,8 +15,8 @@ import (
 	"github.com/klauspost/compress/zip"
 	"github.com/mholt/archives"
 
-	"github.com/pterodactyl/wings/internal/ufs"
-	"github.com/pterodactyl/wings/server/filesystem/archiverext"
+	"github.com/Rene-Roscher/wings/internal/ufs"
+	"github.com/Rene-Roscher/wings/server/filesystem/archiverext"
 )
 
 // CompressFiles compresses all the files matching the given paths in the
@@ -146,7 +146,6 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 	}
 	defer f.Close()
 
-	// Identify the type of archive we are dealing with.
 	format, input, err := archives.Identify(ctx, filepath.Base(file), f)
 	if err != nil {
 		if errors.Is(err, archives.NoMatch) {
@@ -271,6 +270,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 			return err
 		}
 		defer r.Close()
+		
 		if err := fs.Write(p, r, f.Size(), f.Mode()); err != nil {
 			return wrapError(err, opts.FileName)
 		}
@@ -281,3 +281,5 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractStreamOptio
 		return nil
 	})
 }
+
+

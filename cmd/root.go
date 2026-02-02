@@ -26,16 +26,16 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/internal/cron"
-	"github.com/pterodactyl/wings/internal/database"
-	"github.com/pterodactyl/wings/loggers/cli"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/router"
-	"github.com/pterodactyl/wings/server"
-	"github.com/pterodactyl/wings/sftp"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/internal/cron"
+	"github.com/Rene-Roscher/wings/internal/database"
+	"github.com/Rene-Roscher/wings/loggers/cli"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/router"
+	"github.com/Rene-Roscher/wings/server"
+	"github.com/Rene-Roscher/wings/sftp"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 var (
@@ -197,9 +197,9 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	for _, serv := range manager.All() {
 		s := serv
 
-		// For each server we encounter make sure the root data directory exists.
-		if err := s.EnsureDataDirectoryExists(); err != nil {
-			s.Log().Error("could not create root data directory for server: not loading server...")
+		// For each server ensure the minimal environment is configured for the server.
+		if err := s.CreateEnvironment(); err != nil {
+			s.Log().Error("could create base environment for server...")
 			continue
 		}
 
@@ -307,6 +307,12 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	if err := os.MkdirAll(sys.ArchiveDirectory, 0o755); err != nil {
 		log.WithField("error", err).Error("failed to create archive directory")
 	}
+
+	// CRITICAL: Start backup operation cleanup to prevent resource leaks
+	go func() {
+		log.WithField("subsystem", "backup-registry").Info("starting backup operation cleanup goroutine")
+		server.StartBackupOperationCleanup(cmd.Context())
+	}()
 
 	// Ensure the backup directory exists.
 	if err := os.MkdirAll(sys.BackupDirectory, 0o755); err != nil {
@@ -446,8 +452,8 @@ __ [blue][bold]Pterodactyl[reset] _____/___/_______ _______ ______
 Copyright © 2018 - %d Dane Everitt & Contributors
 
 Website:  https://pterodactyl.io
- Source:  https://github.com/pterodactyl/wings
-License:  https://github.com/pterodactyl/wings/blob/develop/LICENSE
+ Source:  https://github.com/Rene-Roscher/wings
+License:  https://github.com/Rene-Roscher/wings/blob/develop/LICENSE
 
 This software is made available under the terms of the MIT license.
 The above copyright notice and this permission notice shall be included

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Progress is used to track the progress of any I/O operation that are being
@@ -18,6 +18,9 @@ type Progress struct {
 
 	// Writer .
 	Writer io.Writer
+
+	// ProgressCallback - optional callback for progress updates (ultra-lightweight)
+	ProgressCallback func()
 }
 
 // NewProgress returns a new progress tracker for the given total size.
@@ -44,10 +47,41 @@ func (p *Progress) SetTotal(total uint64) {
 	atomic.StoreUint64(&p.total, total)
 }
 
+// AddWritten adds to the written counter without allocating memory.
+// This is optimized for high-frequency calls with minimal overhead.
+func (p *Progress) AddWritten(bytes uint64) {
+	atomic.AddUint64(&p.written, bytes)
+
+	// Ultra-lightweight callback trigger - no goroutine overhead
+	if p.ProgressCallback != nil {
+		// Direct call with minimal panic protection
+		// This is called VERY frequently, so optimize for speed
+		func() {
+			defer func() {
+				_ = recover() // Silent recovery - progress callback failures must never break backups
+			}()
+			p.ProgressCallback()
+		}()
+	}
+}
+
 // Write totals the number of bytes that have been written to the writer.
+// This is the hot path for backup performance - optimized for minimal overhead.
 func (p *Progress) Write(v []byte) (int, error) {
 	n := len(v)
 	atomic.AddUint64(&p.written, uint64(n))
+
+	// Ultra-lightweight progress callback (no overhead if nil)
+	// CRITICAL: Never let progress callback break the backup process
+	// This is called on EVERY write operation, so minimize overhead
+	if p.ProgressCallback != nil {
+		// Inline panic protection - no function call overhead
+		defer func() {
+			_ = recover() // Silent recovery - progress callback failures must never break backups
+		}()
+		p.ProgressCallback()
+	}
+
 	if p.Writer != nil {
 		return p.Writer.Write(v)
 	}

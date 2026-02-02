@@ -2,7 +2,7 @@ package backup
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"io/fs"
@@ -14,9 +14,9 @@ import (
 	"github.com/mholt/archives"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/server/filesystem"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/server/filesystem"
 )
 
 var format = archives.CompressedArchive{
@@ -96,6 +96,14 @@ func (b *Backup) Path() string {
 	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+".tar.gz")
 }
 
+// PathForLocalBackup returns the path for a LocalBackup, checking for foundPath override
+func (b *Backup) PathForLocalBackup(foundPath string) string {
+	if foundPath != "" {
+		return foundPath // Use discovered path for backward compatibility
+	}
+	return b.Path() // Use standard path generation
+}
+
 // Size returns the size of the generated backup.
 func (b *Backup) Size() (int64, error) {
 	st, err := os.Stat(b.Path())
@@ -108,7 +116,7 @@ func (b *Backup) Size() (int64, error) {
 
 // Checksum returns the SHA256 checksum of a backup.
 func (b *Backup) Checksum() ([]byte, error) {
-	h := sha1.New()
+	h := sha256.New()
 
 	f, err := os.Open(b.Path())
 	if err != nil {
@@ -127,7 +135,7 @@ func (b *Backup) Checksum() ([]byte, error) {
 // Details returns both the checksum and size of the archive currently stored on
 // the disk to the caller.
 func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
-	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
+	ad := ArchiveDetails{ChecksumType: "sha256", Parts: parts}
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {

@@ -16,9 +16,9 @@ import (
 	"github.com/klauspost/pgzip"
 	ignore "github.com/sabhiram/go-gitignore"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/internal/progress"
-	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/internal/progress"
+	"github.com/Rene-Roscher/wings/internal/ufs"
 )
 
 const memory = 4 * 1024
@@ -129,25 +129,24 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		a.Files = files
 	}
 
-	// Choose which compression level to use based on the compression_level configuration option
-	var compressionLevel int
-	switch config.Get().System.Backups.CompressionLevel {
-	case "none":
-		compressionLevel = pgzip.NoCompression
-	case "best_compression":
-		compressionLevel = pgzip.BestCompression
-	default:
-		compressionLevel = pgzip.BestSpeed
+	// Create compressor based on configured format
+	compressor, err := a.createCompressor(w)
+	if err != nil {
+		return errors.Wrap(err, "failed to create compressor")
 	}
+	defer func() {
+		if err := compressor.Close(); err != nil {
+			log.WithError(err).Warn("failed to close compressor")
+		}
+	}()
 
-	// Create a new gzip writer around the file.
-	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
-	_ = gw.SetConcurrency(1<<20, 1)
-	defer gw.Close()
-
-	// Create a new tar writer around the gzip writer.
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
+	// Create a new tar writer around the compressor.
+	tw := tar.NewWriter(compressor)
+	defer func() {
+		if err := tw.Close(); err != nil {
+			log.WithError(err).Warn("failed to close tar writer")
+		}
+	}()
 
 	a.w = NewTarProgress(tw, a.Progress)
 
@@ -204,10 +203,8 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 		base = filepath.Base(a.BaseDirectory) + "/"
 	}
 	return func(dirfd int, name, relative string, d ufs.DirEntry) error {
-		// Skip directories because we are walking them recursively.
-		if d.IsDir() {
-			return nil
-		}
+		// CRITICAL: Include directories in archive to preserve empty directories!
+		// We need to archive directory entries to maintain the complete structure.
 
 		// If base isn't empty, strip it from the relative path. This fixes an
 		// issue when creating an archive starting from a nested directory.
@@ -228,8 +225,8 @@ func (a *Archive) callback(opts ...walkFunc) walkFunc {
 			}
 		}
 
-		// Add the file to the archive, if it is nested in a directory,
-		// the directory will be automatically "created" in the archive.
+		// Add the file or directory to the archive. This is CRITICAL for preserving
+		// empty directories - we must include directory entries in the TAR archive.
 		return a.addToArchive(dirfd, name, relative, d)
 	}
 }
@@ -308,7 +305,8 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", name)
 	}
 
-	// If the size of the file is less than 1 (most likely for symlinks), skip writing the file.
+	// If the size of the file is less than 1 (directories and symlinks), skip writing file content.
+	// For directories, we've already written the header which preserves the directory structure.
 	if header.Size < 1 {
 		return nil
 	}
@@ -341,4 +339,26 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
 	return nil
+}
+
+// createCompressor creates the appropriate compressor based on the configured format
+func (a *Archive) createCompressor(w io.Writer) (io.WriteCloser, error) {
+	// Choose which compression level to use based on the compression_level configuration option
+	var compressionLevel int
+	switch config.Get().System.Backups.CompressionLevel {
+	case "none":
+		compressionLevel = pgzip.NoCompression
+	case "best_compression":
+		compressionLevel = pgzip.BestCompression
+	default:
+		compressionLevel = pgzip.BestSpeed
+	}
+
+	// Create a new gzip writer around the writer.
+	gw, err := pgzip.NewWriterLevel(w, compressionLevel)
+	if err != nil {
+		return nil, err
+	}
+	_ = gw.SetConcurrency(1<<20, 1)
+	return gw, nil
 }

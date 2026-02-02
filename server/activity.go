@@ -6,8 +6,8 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/pterodactyl/wings/internal/database"
-	"github.com/pterodactyl/wings/internal/models"
+	"github.com/Rene-Roscher/wings/internal/database"
+	"github.com/Rene-Roscher/wings/internal/models"
 )
 
 const ActivityPowerPrefix = "server:power."
@@ -20,6 +20,10 @@ const (
 	ActivitySftpRename          = models.Event("server:sftp.rename")
 	ActivitySftpDelete          = models.Event("server:sftp.delete")
 	ActivityFileUploaded        = models.Event("server:file.uploaded")
+	ActivityFileDownloaded      = models.Event("server:file.downloaded")
+	ActivityFileCompressed      = models.Event("server:file.compressed")
+	ActivityFileDecompressed    = models.Event("server:file.decompressed")
+	ActivityFileChmod           = models.Event("server:file.chmod")
 )
 
 // RequestActivity is a wrapper around a LoggedEvent that is able to track additional request
@@ -62,5 +66,19 @@ func (s *Server) SaveActivity(a RequestActivity, event models.Event, metadata mo
 				WithField("event", event).
 				Error("activity: failed to save event")
 		}
+	}()
+
+	// Publish activity as event over WebSocket (async but throttled)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.Log().WithField("error", r).WithField("event", event).Error("activity: failed to publish WebSocket event")
+			}
+		}()
+		s.Events().Publish(ActivityEvent, map[string]any{
+			"event":    string(event),
+			"user":     a.user,
+			"metadata": metadata,
+		})
 	}()
 }

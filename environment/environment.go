@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/pterodactyl/wings/events"
+	"github.com/Rene-Roscher/wings/events"
 )
 
 const (
@@ -16,10 +16,15 @@ const (
 )
 
 const (
-	ProcessOfflineState  = "offline"
-	ProcessStartingState = "starting"
-	ProcessRunningState  = "running"
-	ProcessStoppingState = "stopping"
+	ProcessOfflineState   = "offline"
+	ProcessStartingState  = "starting"
+	ProcessRunningState   = "running"
+	ProcessStoppingState  = "stopping"
+	ProcessBackupState    = "backup"
+	ProcessRestoringState = "restore"
+	// NEW: Queue states to show when operations are waiting
+	ProcessBackupQueuedState  = "backup_queued"
+	ProcessRestoreQueuedState = "restore_queued"
 )
 
 // Defines the basic interface that all environments need to implement so that

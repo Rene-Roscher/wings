@@ -1,8 +1,8 @@
 package server
 
 import (
-	"github.com/pterodactyl/wings/events"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/events"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Defines all the possible output events for a server.
@@ -16,9 +16,12 @@ const (
 	StatsEvent                  = "stats"
 	BackupRestoreCompletedEvent = "backup restore completed"
 	BackupCompletedEvent        = "backup completed"
+	BackupProgressEvent         = "backup progress"
+	DownloadProgressEvent       = "download progress"
 	TransferLogsEvent           = "transfer logs"
 	TransferStatusEvent         = "transfer status"
 	DeletedEvent                = "deleted"
+	ActivityEvent               = "activity"
 )
 
 // Events returns the server's emitter instance.

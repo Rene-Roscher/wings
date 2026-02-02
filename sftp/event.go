@@ -4,14 +4,20 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 
-	"github.com/pterodactyl/wings/internal/database"
-	"github.com/pterodactyl/wings/internal/models"
+	"github.com/Rene-Roscher/wings/internal/database"
+	"github.com/Rene-Roscher/wings/internal/models"
 )
 
+// EventPublisher interface to avoid circular import
+type EventPublisher interface {
+	PublishActivity(event string, data map[string]any)
+}
+
 type eventHandler struct {
-	ip     string
-	user   string
-	server string
+	ip        string
+	user      string
+	server    string
+	publisher EventPublisher // Interface to publish events
 }
 
 type FileAction struct {
@@ -47,6 +53,23 @@ func (eh *eventHandler) Log(e models.Event, fa FileAction) error {
 	if tx := database.Instance().Create(a.SetUser(eh.user)); tx.Error != nil {
 		return errors.WithStack(tx.Error)
 	}
+
+	// Publish activity as event over WebSocket (async to avoid blocking)
+	if eh.publisher != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Cannot access server logger here, so no logging
+				}
+			}()
+			eh.publisher.PublishActivity("activity", map[string]any{
+				"event":    string(e),
+				"user":     eh.user,
+				"metadata": metadata,
+			})
+		}()
+	}
+
 	return nil
 }
 

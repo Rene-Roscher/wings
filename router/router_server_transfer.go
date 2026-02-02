@@ -9,11 +9,11 @@ import (
 	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/router/middleware"
-	"github.com/pterodactyl/wings/server"
-	"github.com/pterodactyl/wings/server/installer"
-	"github.com/pterodactyl/wings/server/transfer"
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/router/middleware"
+	"github.com/Rene-Roscher/wings/server"
+	"github.com/Rene-Roscher/wings/server/installer"
+	"github.com/Rene-Roscher/wings/server/transfer"
 )
 
 // Data passed over to initiate a server transfer.
@@ -32,12 +32,24 @@ func postServerTransfer(c *gin.Context) {
 
 	s := ExtractServer(c)
 
-	// Check if the server is already being transferred.
+	// Check if the server is already being transferred or has other operations running.
 	// There will be another endpoint for resetting this value either by deleting the
 	// server, or by canceling the transfer.
 	if s.IsTransferring() {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"error": "A transfer is already in progress for this server.",
+		})
+		return
+	}
+	if s.IsBackingUp() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A backup operation is already running for this server - transfer blocked.",
+		})
+		return
+	}
+	if s.IsRestoring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A restore operation is already running for this server - transfer blocked.",
 		})
 		return
 	}

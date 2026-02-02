@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -13,12 +15,12 @@ import (
 	"github.com/apex/log"
 	"github.com/creasty/defaults"
 
-	"github.com/pterodactyl/wings/config"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/events"
-	"github.com/pterodactyl/wings/remote"
-	"github.com/pterodactyl/wings/server/filesystem"
-	"github.com/pterodactyl/wings/system"
+	"github.com/Rene-Roscher/wings/config"
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/events"
+	"github.com/Rene-Roscher/wings/remote"
+	"github.com/Rene-Roscher/wings/server/filesystem"
+	"github.com/Rene-Roscher/wings/system"
 )
 
 // Server is the high level definition for a server instance being controlled
@@ -61,6 +63,7 @@ type Server struct {
 	installing   *system.AtomicBool
 	transferring *system.AtomicBool
 	restoring    *system.AtomicBool
+	backingUp    *system.AtomicBool
 
 	// The console throttler instance used to control outputs.
 	throttler    *ConsoleThrottle
@@ -69,11 +72,57 @@ type Server struct {
 	// Tracks open websocket connections for the server.
 	wsBag       *WebsocketBag
 	wsBagLocker sync.Mutex
+	sftpBag     *system.ContextBag
 
 	sinks map[system.SinkName]*system.SinkPool
 
 	logSink     *system.SinkPool
 	installSink *system.SinkPool
+}
+
+// AtomicStateTransition represents an atomic change to server operational state
+type AtomicStateTransition struct {
+	EnvironmentState string
+	BackingUp        *bool   // nil = no change
+	Restoring        *bool   // nil = no change
+	Transferring     *bool   // nil = no change
+}
+
+// ApplyAtomicStateTransition atomically applies state changes to prevent race conditions
+func (s *Server) ApplyAtomicStateTransition(transition AtomicStateTransition) {
+	s.Log().WithFields(log.Fields{
+		"before_backing_up":   s.backingUp.Load(),
+		"before_restoring":    s.restoring.Load(),
+		"before_transferring": s.transferring.Load(),
+		"before_env_state":    s.Environment.State(),
+	}).Debug("ATOMIC STATE TRANSITION: before")
+	
+	// Apply all atomic state changes together
+	if transition.BackingUp != nil {
+		s.Log().WithField("new_backing_up", *transition.BackingUp).Debug("setting BackingUp flag")
+		s.backingUp.Store(*transition.BackingUp)
+	}
+	if transition.Restoring != nil {
+		s.Log().WithField("new_restoring", *transition.Restoring).Debug("setting Restoring flag")
+		s.restoring.Store(*transition.Restoring)
+	}
+	if transition.Transferring != nil {
+		s.Log().WithField("new_transferring", *transition.Transferring).Debug("setting Transferring flag")
+		s.transferring.Store(*transition.Transferring)
+	}
+	
+	// Finally set environment state
+	if transition.EnvironmentState != "" {
+		s.Log().WithField("new_env_state", transition.EnvironmentState).Debug("setting Environment state")
+		s.Environment.SetState(transition.EnvironmentState)
+	}
+	
+	s.Log().WithFields(log.Fields{
+		"after_backing_up":   s.backingUp.Load(),
+		"after_restoring":    s.restoring.Load(),
+		"after_transferring": s.transferring.Load(),
+		"after_env_state":    s.Environment.State(),
+	}).Debug("ATOMIC STATE TRANSITION: after")
 }
 
 // New returns a new server instance with a context and all of the default
@@ -87,6 +136,7 @@ func New(client remote.Client) (*Server, error) {
 		installing:   system.NewAtomicBool(false),
 		transferring: system.NewAtomicBool(false),
 		restoring:    system.NewAtomicBool(false),
+		backingUp:    system.NewAtomicBool(false),
 		powerLock:    system.NewLocker(),
 		sinks: map[system.SinkName]*system.SinkPool{
 			system.LogSink:     system.NewSinkPool(),
@@ -112,6 +162,24 @@ func (s *Server) CleanupForDestroy() {
 	s.DestroyAllSinks()
 	s.Websockets().CancelAll()
 	s.powerLock.Destroy()
+	
+	// CRITICAL: Cancel all running backup operations for this server
+	// This prevents resource leaks and inconsistent states during server deletion
+	registry := GetBackupOperationRegistry()
+	if err := registry.CancelAllForServer(s.ID()); err != nil {
+		s.Log().WithError(err).Error("failed to cancel backup operations during server cleanup")
+	}
+	
+	// CRITICAL: Clean up local backup files to prevent disk space leaks
+	// This removes orphaned backup files when the server is deleted
+	go func() {
+		// Run backup file cleanup in background to avoid blocking server deletion
+		// Import is required here since backup package imports server package (circular import)
+		// We'll call this via a method on the server instead
+		if err := s.cleanupBackupFiles(); err != nil {
+			s.Log().WithError(err).Error("failed to clean up backup files during server deletion")
+		}
+	}()
 }
 
 // ID returns the UUID for the server instance.
@@ -199,6 +267,16 @@ func (s *Server) Sync() error {
 
 	s.SyncWithEnvironment()
 
+	// If the server is suspended immediately disconnect all open websocket connections
+	// and any connected SFTP clients. We don't need to worry about revoking any JWTs
+	// here since they'll be blocked from re-connecting to the websocket anyways. This
+	// just forces the client to disconnect and attempt to reconnect (rather than waiting
+	// on them to send a message and hit that disconnect logic).
+	if s.IsSuspended() {
+		s.Websockets().CancelAll()
+		s.Sftp().CancelAll()
+	}
+
 	return nil
 }
 
@@ -246,6 +324,18 @@ func (s *Server) CreateEnvironment() error {
 	// Ensure the data directory exists before getting too far through this process.
 	if err := s.EnsureDataDirectoryExists(); err != nil {
 		return err
+	}
+
+	cfg := config.Get()
+	if cfg.System.MachineID.Enable {
+		// Hytale wants a machine-id in order to encrypt tokens for the server. So
+		// write a machine-id file for the server that contains the server's UUID
+		// without any dashes.
+		p := filepath.Join(cfg.System.MachineID.Directory, s.ID())
+		machineID := append(bytes.ReplaceAll([]byte(s.ID()), []byte{'-'}, []byte{}), '\n')
+		if err := os.WriteFile(p, machineID, 0o644); err != nil {
+			return fmt.Errorf("failed to write machine-id (at '%s') for server '%s': %w", p, s.ID(), err)
+		}
 	}
 
 	return s.Environment.Create()
@@ -361,4 +451,105 @@ func (s *Server) ToAPIResponse() APIResponse {
 		Utilization:   s.Proc(),
 		Configuration: *s.Config(),
 	}
+}
+
+// PublishActivity implements the EventPublisher interface for SFTP event handling
+func (s *Server) PublishActivity(event string, data map[string]any) {
+	s.Events().Publish(ActivityEvent, data)
+}
+
+// cleanupBackupFiles removes all local backup files associated with this server
+// This method is called during server deletion to prevent orphaned backup files
+func (s *Server) cleanupBackupFiles() error {
+	// We need to avoid circular imports since backup package imports server package
+	// For now, we'll implement a basic cleanup using the same logic as in backup_local.go
+	// but without importing the backup package
+	
+	backupDir := config.Get().System.BackupDirectory
+	logger := s.Log().WithFields(log.Fields{
+		"server_id":  s.ID(),
+		"backup_dir": backupDir,
+	})
+
+	// List all files in backup directory
+	files, err := os.ReadDir(backupDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logger.Debug("backup directory does not exist, nothing to clean up")
+			return nil
+		}
+		return errors.WrapIf(err, "failed to read backup directory")
+	}
+
+	var removedFiles []string
+	var failedRemovals []string
+
+	// Common backup file extensions
+	backupExtensions := []string{".tar.gz", ".tar.zst", ".tar", ".gz", ".zst"}
+
+	// Iterate through all files and find backup files
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		fileName := file.Name()
+		
+		// Check if this file looks like a backup file
+		isBackupFile := false
+		lowerName := strings.ToLower(fileName)
+		for _, ext := range backupExtensions {
+			if strings.HasSuffix(lowerName, ext) {
+				isBackupFile = true
+				break
+			}
+		}
+		
+		if !isBackupFile {
+			continue
+		}
+
+		// Extract potential backup UUID from filename (before first dot)
+		parts := strings.Split(fileName, ".")
+		if len(parts) < 2 {
+			continue // Not a valid backup file format
+		}
+
+		backupUUID := parts[0]
+		
+		// Skip if the UUID doesn't look valid (should be 36 characters for UUID)
+		if len(backupUUID) != 36 {
+			continue
+		}
+
+		filePath := filepath.Join(backupDir, fileName)
+		
+		logger.WithField("file", fileName).Debug("found backup file, attempting removal")
+		
+		if err := os.Remove(filePath); err != nil {
+			logger.WithError(err).WithField("file", fileName).Error("failed to remove backup file")
+			failedRemovals = append(failedRemovals, fileName)
+		} else {
+			logger.WithField("file", fileName).Info("removed backup file")
+			removedFiles = append(removedFiles, fileName)
+		}
+	}
+
+	// Log summary
+	if len(removedFiles) > 0 {
+		logger.WithFields(log.Fields{
+			"removed_count": len(removedFiles),
+			"removed_files": removedFiles,
+		}).Info("cleaned up backup files for server")
+	}
+
+	if len(failedRemovals) > 0 {
+		logger.WithFields(log.Fields{
+			"failed_count": len(failedRemovals),
+			"failed_files": failedRemovals,
+		}).Warn("some backup files could not be removed")
+		return errors.New("failed to remove some backup files")
+	}
+
+	return nil
 }
