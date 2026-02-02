@@ -8,8 +8,48 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/Rene-Roscher/wings/environment"
+	"github.com/Rene-Roscher/wings/events"
 	"github.com/Rene-Roscher/wings/internal/progress"
+	"github.com/Rene-Roscher/wings/system"
 )
+
+// mockEnvironment is a minimal mock implementation for testing
+type mockEnvironment struct{}
+
+func (m *mockEnvironment) Type() string { return "mock" }
+func (m *mockEnvironment) Config() *environment.Configuration { return nil }
+func (m *mockEnvironment) Events() *events.Bus { return events.NewBus() }
+func (m *mockEnvironment) Exists() (bool, error) { return true, nil }
+func (m *mockEnvironment) IsRunning(ctx context.Context) (bool, error) { return false, nil }
+func (m *mockEnvironment) InSituUpdate() error { return nil }
+func (m *mockEnvironment) OnBeforeStart(ctx context.Context) error { return nil }
+func (m *mockEnvironment) Start(ctx context.Context) error { return nil }
+func (m *mockEnvironment) Stop(ctx context.Context) error { return nil }
+func (m *mockEnvironment) WaitForStop(ctx context.Context, duration time.Duration, terminate bool) error { return nil }
+func (m *mockEnvironment) Terminate(ctx context.Context, signal string) error { return nil }
+func (m *mockEnvironment) Destroy() error { return nil }
+func (m *mockEnvironment) ExitState() (uint32, bool, error) { return 0, false, nil }
+func (m *mockEnvironment) Create() error { return nil }
+func (m *mockEnvironment) Attach(ctx context.Context) error { return nil }
+func (m *mockEnvironment) SendCommand(string) error { return nil }
+func (m *mockEnvironment) Readlog(int) ([]string, error) { return nil, nil }
+func (m *mockEnvironment) State() string { return "offline" }
+func (m *mockEnvironment) SetState(string) {}
+func (m *mockEnvironment) Uptime(ctx context.Context) (int64, error) { return 0, nil }
+func (m *mockEnvironment) SetLogCallback(func([]byte)) {}
+func (m *mockEnvironment) SetStream(bool) {}
+
+// newMockServer creates a minimal Server instance for testing
+func newMockServer() *Server {
+	return &Server{
+		installing:   system.NewAtomicBool(false),
+		transferring: system.NewAtomicBool(false),
+		restoring:    system.NewAtomicBool(false),
+		backingUp:    system.NewAtomicBool(false),
+		Environment:  &mockEnvironment{},
+	}
+}
 
 // TestSimpleProgressTrackerBasics tests core progress tracking functionality
 func TestSimpleProgressTrackerBasics(t *testing.T) {
@@ -22,7 +62,7 @@ func TestSimpleProgressTrackerBasics(t *testing.T) {
 	prog.SetTotal(100)
 
 	// Create test server (minimal mock)
-	mockServer := &Server{}
+	mockServer := newMockServer()
 
 	// Create progress tracker
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "test-backup-123", "local", prog)
@@ -52,7 +92,7 @@ func TestProgressTrackerThrottling(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(1000)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "throttle-test", "s3", prog)
 	defer tracker.Close()
 
@@ -87,7 +127,7 @@ func TestProgressTrackerFinalProgress(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "final-test", "s3", prog)
 	defer tracker.Close()
 
@@ -112,7 +152,7 @@ func TestProgressTrackerFinalProgressFailure(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "failure-test", "local", prog)
 	defer tracker.Close()
 
@@ -137,7 +177,7 @@ func TestProgressTrackerContextCancellation(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "cancel-test", "s3", prog)
 
 	// Make some progress
@@ -175,7 +215,7 @@ func TestProgressTrackerByteMode(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	// Don't set total - simulates unknown backup size
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "byte-test", "s3", prog)
 	defer tracker.Close()
 
@@ -201,7 +241,7 @@ func TestProgressTrackerResourceCleanup(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(100)
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "cleanup-test", "local", prog)
 
 	// Make progress to spawn some goroutines
@@ -274,7 +314,7 @@ func TestProgressTrackerPerformance(t *testing.T) {
 	prog := progress.NewProgress(1000)
 	prog.SetTotal(1000000) // 1M total
 
-	mockServer := &Server{}
+	mockServer := newMockServer()
 	tracker := NewSimpleProgressTracker(ctx, mockServer, "perf-test", "local", prog)
 	defer tracker.Close()
 

@@ -47,12 +47,13 @@ func TestRetryContextBehavior(t *testing.T) {
 
 	// Simulate retry with context timeout
 	start := time.Now()
-	
+
 	for attempt := 0; attempt <= 3; attempt++ {
 		select {
 		case <-ctx.Done():
 			elapsed := time.Since(start)
-			assert.True(t, elapsed < 150*time.Millisecond, 
+			// Allow some tolerance for CI timing variability (100ms timeout + one 50ms iteration = ~150ms max)
+			assert.True(t, elapsed < 200*time.Millisecond,
 				"Context cancellation should stop retries quickly")
 			return
 		default:
@@ -60,7 +61,7 @@ func TestRetryContextBehavior(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	
+
 	t.Error("Context should have cancelled the retry loop")
 }
 

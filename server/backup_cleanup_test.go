@@ -2,14 +2,27 @@ package server
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Rene-Roscher/wings/config"
 	"github.com/Rene-Roscher/wings/server/backup"
 )
+
+func init() {
+	// Initialize config for tests to prevent nil pointer dereference
+	tmpDir := os.TempDir()
+	config.Set(&config.Configuration{
+		AuthenticationToken: "test-token",
+		System: config.SystemConfiguration{
+			BackupDirectory: tmpDir,
+		},
+	})
+}
 
 // TestBackupCleanupOnServerDeletion tests backup file cleanup when server is deleted
 func TestBackupCleanupOnServerDeletion(t *testing.T) {

@@ -1,6 +1,10 @@
 package router
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Rene-Roscher/wings/server/backup"
+)
 
 func TestIsValidBackupContentType(t *testing.T) {
 	tests := []struct {
@@ -50,9 +54,9 @@ func TestIsValidBackupContentType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := isValidBackupContentType(tt.contentType)
+			result := backup.IsValidBackupContentType(tt.contentType)
 			if result != tt.expected {
-				t.Errorf("isValidBackupContentType(%q) = %v, expected %v", 
+				t.Errorf("backup.IsValidBackupContentType(%q) = %v, expected %v",
 					tt.contentType, result, tt.expected)
 			}
 		})

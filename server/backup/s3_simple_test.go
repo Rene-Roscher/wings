@@ -3,7 +3,6 @@ package backup
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"io"
 	"os"
@@ -13,14 +12,29 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Rene-Roscher/wings/config"
 )
+
+func init() {
+	// Initialize config for tests to prevent nil pointer dereference
+	tmpDir := os.TempDir()
+	config.Set(&config.Configuration{
+		AuthenticationToken: "test-token",
+		System: config.SystemConfiguration{
+			BackupDirectory: tmpDir,
+			Backups: config.Backups{
+				WriteLimit: 0, // No write limit for tests
+			},
+		},
+	})
+}
 
 // TestS3RestoreDirectoryHandling tests that S3 restore can handle directories correctly
 func TestS3RestoreDirectoryHandling(t *testing.T) {
-	// Create test TAR+GZIP data in memory (simulating S3 backup content)
+	// Create test TAR data in memory (S3 Restore expects ALREADY DECOMPRESSED TAR stream)
 	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gw)
+	tw := tar.NewWriter(&buf)
 	
 	// Create test entries including the problematic cases
 	entries := []struct {
@@ -63,10 +77,9 @@ func TestS3RestoreDirectoryHandling(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	
+
 	require.NoError(t, tw.Close())
-	require.NoError(t, gw.Close())
-	
+
 	// Test S3 restore functionality - create minimal S3Backup without client dependencies
 	s3backup := &S3Backup{
 		Backup: Backup{
@@ -124,14 +137,13 @@ func TestS3RestoreDirectoryHandling(t *testing.T) {
 	t.Logf("SUCCESS: S3 restore processed %d entries correctly", len(processedEntries))
 }
 
-// TestS3RestoreCompressionDetection verifies S3 can detect and handle different compression formats
+// TestS3RestoreCompressionDetection verifies S3 can handle TAR archives
 func TestS3RestoreCompressionDetection(t *testing.T) {
-	// Test only GZIP for now (most common format)
-	t.Run("GZIP_Detection", func(t *testing.T) {
-		// Create simple GZIP compressed TAR
+	// Test TAR extraction (S3 Restore expects decompressed TAR stream)
+	t.Run("TAR_Extraction", func(t *testing.T) {
+		// Create simple TAR (decompression happens before S3 Restore is called)
 		var buf bytes.Buffer
-		gw := gzip.NewWriter(&buf)
-		tw := tar.NewWriter(gw)
+		tw := tar.NewWriter(&buf)
 		
 		// Single test entry
 		header := &tar.Header{
@@ -146,9 +158,8 @@ func TestS3RestoreCompressionDetection(t *testing.T) {
 		_, err := tw.Write([]byte("test"))
 		require.NoError(t, err)
 		require.NoError(t, tw.Close())
-		require.NoError(t, gw.Close())
-		
-		// Test S3 restore can detect and process GZIP
+
+		// Test S3 restore can process TAR
 		s3backup := &S3Backup{
 			Backup: Backup{
 				Uuid:    "test-gzip",
@@ -175,9 +186,9 @@ func TestS3RestoreCompressionDetection(t *testing.T) {
 			return nil
 		})
 		
-		require.NoError(t, err, "S3 restore should handle GZIP compression")
-		assert.Equal(t, "test", detectedContent, "Content should be correctly decompressed")
-		
-		t.Log("SUCCESS: S3 restore correctly detected and processed GZIP compression")
+		require.NoError(t, err, "S3 restore should handle TAR extraction")
+		assert.Equal(t, "test", detectedContent, "Content should be correctly extracted")
+
+		t.Log("SUCCESS: S3 restore correctly processed TAR archive")
 	})
 }

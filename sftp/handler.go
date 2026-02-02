@@ -302,3 +302,7 @@ func (h *Handler) can(permission string) bool {
 	}
 	return false
 }
+
+func (h *Handler) User() string {
+	return h.events.user
+}
